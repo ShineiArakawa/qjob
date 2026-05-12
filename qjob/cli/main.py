@@ -6,7 +6,9 @@ import typing
 import typer
 
 import qjob.api.server as server
+import qjob.cli.dashboard as dashboard
 import qjob.cli.service as service
+import qjob.core.database as database
 
 # --------------------------------------------------------------------------------------
 # Typer application
@@ -177,6 +179,21 @@ def resources() -> None:
     _print_resources(info)
 
 
+@app.command()
+def dashboard_cmd(
+    refresh: float = typer.Option(
+        3.0, "--refresh", "-r", help="Seconds between screen refreshes."
+    ),
+) -> None:
+    """
+    Open the live TUI dashboard showing resources and job status.
+
+    Requires the qjob API server to be running.  Press Ctrl+C to exit.
+    """
+
+    dashboard.run(refresh_interval=refresh)
+
+
 # --------------------------------------------------------------------------------------
 # serve  (replaces Phase 1 daemon command)
 
@@ -208,6 +225,26 @@ def serve(
         log_level=log_level,
         reload=reload,
     )
+
+
+# --------------------------------------------------------------------------------------
+# dashboard
+
+
+@app.command()
+def dash(
+    refresh: float = typer.Option(
+        2.0, "--refresh", "-r", help="Seconds between screen refreshes."
+    ),
+) -> None:
+    """
+    Open the live TUI dashboard showing job status and resource usage.
+
+    Connects to the local database directly.  Press Ctrl+C to exit.
+    """
+
+    database.init_db()
+    dashboard.run_dashboard(refresh_interval=refresh)
 
 
 # --------------------------------------------------------------------------------------

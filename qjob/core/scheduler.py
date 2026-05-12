@@ -4,6 +4,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+import math
 import signal
 import threading
 
@@ -21,8 +22,10 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------------------
 # Constants
 
-_DEFAULT_POLL_INTERVAL: float = 2.0   # Seconds between scheduler ticks.
-_DEFAULT_MAX_WORKERS:   int = 64    # Upper bound on concurrently running jobs.
+_DEFAULT_POLL_INTERVAL:    float = 2.0   # Seconds between scheduler ticks.
+_DEFAULT_MAX_WORKERS:      int = 64     # Upper bound on concurrently running jobs.
+_DEFAULT_AGING_FACTOR:     float = 5.0    # Priority points added per hour of waiting.
+_BACKFILL_WALLTIME_MARGIN: float = 0.9    # Backfill job's walltime / reserve window.
 
 
 # --------------------------------------------------------------------------------------
@@ -266,9 +269,11 @@ class Scheduler:
         self,
         poll_interval: float = _DEFAULT_POLL_INTERVAL,
         max_workers:   int = _DEFAULT_MAX_WORKERS,
+        aging_factor:  float = _DEFAULT_AGING_FACTOR,
     ) -> None:
         self._poll_interval = poll_interval
         self._max_workers = max_workers
+        self._aging_factor = aging_factor
         self._pool:    ResourcePool | None = None
         self._running: bool = False
 
@@ -336,12 +341,19 @@ class Scheduler:
 
     async def _tick(self) -> None:
         """
-        Execute one scheduling cycle.
+        Execute one scheduling cycle using EASY Backfill + priority ageing.
 
-        1. Count currently running jobs.
-        2. Fetch QUEUED jobs ordered by priority DESC, submitted_at ASC.
-        3. For each candidate, check resource availability and launch if
-           possible.
+        Steps
+        -----
+        1. Release resources held by newly finished jobs.
+        2. Apply ageing to all queued jobs so long-waiting jobs gain priority.
+        3. Re-sort the queue by effective priority DESC, submitted_at ASC.
+        4. Try to run the head job (highest effective priority).
+           - If the head job fits: launch it and continue down the queue.
+           - If the head job does not fit: estimate when it can start
+             (``reservation_window``), then scan the remaining queue for
+             backfill candidates whose walltime fits within that window.
+        5. Repeat until the worker slot limit is reached.
 
         Parameters
         ----------
@@ -358,22 +370,61 @@ class Scheduler:
             if slots <= 0:
                 return
 
-            # Collect newly finished jobs and release their resources.
             self._release_finished_jobs(session)
 
-            # Fetch candidates in FIFO order within each priority band.
             candidates = self._fetch_queued(session)
+            if not candidates:
+                return
+
+            # Apply ageing so waiting jobs gain priority over time.
+            self._apply_aging(session, candidates)
+
+            # Re-sort after ageing: effective_priority DESC, submitted_at ASC.
+            candidates.sort(
+                key=lambda j: (-self._effective_priority(j), j.submitted_at or 0)
+            )
 
             dispatched = 0
-            for job in candidates:
+            launched_ids: set[str] = set()
+
+            for head_idx, head in enumerate(candidates):
                 if dispatched >= slots:
                     break
-                if self._pool is None or not self._pool.can_fit(job):
+                if head.id in launched_ids:
                     continue
+                if self._pool is None:
+                    break
 
-                cpu_ids, gpu_ids = self._pool.allocate(job)
-                self._launch(session, job, cpu_ids, gpu_ids)
-                dispatched += 1
+                if self._pool.can_fit(head):
+                    cpu_ids, gpu_ids = self._pool.allocate(head)
+                    self._launch(session, head, cpu_ids, gpu_ids)
+                    launched_ids.add(head.id)
+                    dispatched += 1
+                else:
+                    # Head job cannot run now.  Estimate the earliest time
+                    # its resources will be available (reservation window).
+                    reservation_sec = self._estimate_reservation_window(session, head)
+                    if reservation_sec is None:
+                        # Cannot estimate: skip backfill for this head job.
+                        continue
+
+                    # Scan remaining candidates for backfill opportunities.
+                    backfill = self._find_backfill_jobs(
+                        candidates=candidates[head_idx + 1:],
+                        launched_ids=launched_ids,
+                        reservation_sec=reservation_sec,
+                        slots_remaining=slots - dispatched,
+                    )
+                    for bf_job in backfill:
+                        if self._pool.can_fit(bf_job):
+                            cpu_ids, gpu_ids = self._pool.allocate(bf_job)
+                            self._launch(session, bf_job, cpu_ids, gpu_ids)
+                            launched_ids.add(bf_job.id)
+                            dispatched += 1
+                            logger.info(
+                                "Backfilled job %s (walltime=%ss, window=%ss).",
+                                bf_job.id, bf_job.walltime_sec, reservation_sec,
+                            )
 
             if dispatched:
                 logger.debug("Tick dispatched %d job(s).", dispatched)
@@ -451,6 +502,198 @@ class Scheduler:
             )
             .all()
         )
+
+    def _effective_priority(self, job: models.Job) -> float:
+        """
+        Return the current effective priority of *job* after ageing.
+
+        The effective priority is stored back in ``job.priority`` by
+        ``_apply_aging()``, so this simply returns that value as a float.
+
+        Parameters
+        ----------
+        job : models.Job
+            The queued job.
+
+        Returns
+        -------
+        float
+            Current effective priority score.
+        """
+
+        return float(job.priority)
+
+    def _apply_aging(
+        self,
+        session:    sqlalchemy.orm.Session,
+        candidates: list[models.Job],
+    ) -> None:
+        """
+        Increment each queued job's priority by the ageing factor times the
+        number of hours it has been waiting, then persist the new value.
+
+        Ageing is additive and unbounded — a job that waits long enough will
+        always eventually reach the top of the queue.  The increment is applied
+        once per tick, so the effective rate is
+        ``aging_factor * (poll_interval / 3600)`` priority points per tick.
+
+        Parameters
+        ----------
+        session : sqlalchemy.orm.Session
+            Open DB session used to flush the updated priorities.
+        candidates : list[models.Job]
+            The QUEUED jobs returned by ``_fetch_queued()``.
+
+        Returns
+        -------
+        None
+        """
+
+        import datetime
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        for job in candidates:
+            if job.submitted_at is None:
+                continue
+
+            submitted = job.submitted_at
+            # SQLite returns naive datetimes; attach UTC so subtraction works.
+            if submitted.tzinfo is None:
+                submitted = submitted.replace(tzinfo=datetime.timezone.utc)
+
+            wait_hours = (now - submitted).total_seconds() / 3600.0
+            increment = self._aging_factor * (self._poll_interval / 3600.0)
+            delta = int(increment)
+            if delta > 0:
+                job.priority = min(100, job.priority + delta)
+
+    def _estimate_reservation_window(
+        self,
+        session: sqlalchemy.orm.Session,
+        head:    models.Job,
+    ) -> float | None:
+        """
+        Estimate the number of seconds until *head* can start.
+
+        Looks at all currently RUNNING jobs and finds the earliest time at
+        which enough resources will be free to satisfy ``head``'s requirements,
+        assuming every running job finishes exactly at its walltime.
+
+        Jobs without a walltime are ignored — their finish time cannot be
+        predicted.
+
+        Parameters
+        ----------
+        session : sqlalchemy.orm.Session
+            Open DB session.
+        head : models.Job
+            The head job that is currently blocked.
+
+        Returns
+        -------
+        float | None
+            Estimated seconds until head can start, or ``None`` if the window
+            cannot be determined (e.g. all blocking jobs lack walltimes).
+        """
+
+        import datetime
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        running_jobs = (
+            session.query(models.Job)
+            .filter(models.Job.status == models.JobStatus.RUNNING)
+            .all()
+        )
+
+        # Build a list of (finish_time_sec_from_now, cpus, gpus, mem_mb)
+        # for every running job that has a walltime.
+        finish_events: list[tuple[float, int, int, int]] = []
+        for rj in running_jobs:
+            if rj.walltime_sec is None or rj.started_at is None:
+                continue
+            started = rj.started_at
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=datetime.timezone.utc)
+            remaining = rj.walltime_sec - (now - started).total_seconds()
+            remaining = max(0.0, remaining)
+            cpu_ids: list[int] = json.loads(rj.assigned_cpus) if rj.assigned_cpus else []
+            gpu_ids: list[int] = json.loads(rj.assigned_gpus) if rj.assigned_gpus else []
+            finish_events.append((remaining, len(cpu_ids), len(gpu_ids), rj.req_mem_mb))
+
+        if not finish_events:
+            return None
+
+        # Simulate resource release in chronological order and find the
+        # earliest point at which head's requirements can be satisfied.
+        finish_events.sort(key=lambda e: e[0])
+
+        sim_free_cpus = self._pool.free_cpus if self._pool else 0
+        sim_free_gpus = self._pool.free_gpus if self._pool else 0
+        sim_free_mem = self._pool.free_mem_mb if self._pool else 0
+
+        for finish_sec, cpus, gpus, mem in finish_events:
+            sim_free_cpus += cpus
+            sim_free_gpus += gpus
+            sim_free_mem += mem
+            if (
+                head.req_cpus <= sim_free_cpus
+                and head.req_gpus <= sim_free_gpus
+                and head.req_mem_mb <= sim_free_mem
+            ):
+                return finish_sec
+
+        return None
+
+    def _find_backfill_jobs(
+        self,
+        candidates:      list[models.Job],
+        launched_ids:    set[str],
+        reservation_sec: float,
+        slots_remaining: int,
+    ) -> list[models.Job]:
+        """
+        Return jobs from *candidates* eligible for backfilling.
+
+        A job is eligible when:
+        - It has a walltime set (jobs without walltime are excluded).
+        - Its walltime fits within ``reservation_sec * _BACKFILL_WALLTIME_MARGIN``
+          so it will finish before the head job's resources are needed.
+        - It has not already been launched this tick.
+
+        Parameters
+        ----------
+        candidates : list[models.Job]
+            Remaining queued jobs after the blocked head job.
+        launched_ids : set[str]
+            IDs already dispatched this tick (to avoid double-launch).
+        reservation_sec : float
+            Estimated seconds until the head job's resources are available.
+        slots_remaining : int
+            Maximum number of additional jobs that can be started this tick.
+
+        Returns
+        -------
+        list[models.Job]
+            Backfill candidates in queue order, limited to *slots_remaining*.
+        """
+
+        window = reservation_sec * _BACKFILL_WALLTIME_MARGIN
+        result: list[models.Job] = []
+
+        for job in candidates:
+            if len(result) >= slots_remaining:
+                break
+            if job.id in launched_ids:
+                continue
+            if job.walltime_sec is None:
+                # Cannot guarantee this job finishes before the window closes.
+                continue
+            if job.walltime_sec <= window:
+                result.append(job)
+
+        return result
 
     def _launch(
         self,
@@ -566,8 +809,8 @@ class Scheduler:
         Register SIGTERM and SIGINT handlers to trigger a graceful shutdown.
 
         Signal handlers can only be registered from the main thread.
-        When running inside a test (or any worker thread), this method
-        silently skips registration instead of raising RuntimeError.
+        When running inside a test or a worker thread this method silently
+        skips registration instead of raising RuntimeError.
 
         Parameters
         ----------
