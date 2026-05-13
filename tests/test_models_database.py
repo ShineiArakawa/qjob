@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import os
 
 import pytest
 
@@ -148,7 +149,7 @@ class TestJobStatus:
 
 
 class TestInitDb:
-    """init_db() creates tables and returns an engine."""
+    """init_db() connects to the migrated database and returns an engine."""
 
     def test_returns_engine(self):
         engine = database.get_engine()
@@ -166,11 +167,11 @@ class TestInitDb:
 
     def test_reinit_with_same_url_is_idempotent(self):
         # Calling init_db() again with the same URL must not raise.
-        database.init_db("sqlite:///:memory:")
+        database.init_db(os.environ["QJOB_DB_URL"])
 
     def test_reinit_with_different_url_raises(self):
         with pytest.raises(RuntimeError, match="already called"):
-            database.init_db("sqlite:////tmp/other.db")
+            database.init_db("postgresql+psycopg://qjob:password@localhost:5432/other")
 
 
 # --------------------------------------------------------------------------------------

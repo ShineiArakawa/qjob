@@ -41,7 +41,7 @@ def create_app(db_url: str | None = None) -> fastapi.FastAPI:
     ----------
     db_url : str | None
         SQLAlchemy database URL.  When None, ``database.init_db()`` uses
-        its own default (``QJOB_DB_URL`` env var or ``sqlite:///qjob.db``).
+        ``QJOB_DB_URL`` from the environment.
 
     Returns
     -------
@@ -65,11 +65,13 @@ def create_app(db_url: str | None = None) -> fastapi.FastAPI:
             yield
         finally:
             _sched.stop()
+
             try:
                 await asyncio.wait_for(task, timeout=10.0)
             except asyncio.TimeoutError:
                 logger.warning("Scheduler did not stop within 10s; cancelling task.")
                 task.cancel()
+
             logger.info("Scheduler stopped.")
 
     app = fastapi.FastAPI(

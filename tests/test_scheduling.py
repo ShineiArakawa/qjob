@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import datetime
 import json
 
@@ -109,22 +110,11 @@ def _make_running_job(
     return job
 
 
-def _make_scheduler(
-    poll_interval: float = 2.0,
-    aging_factor:  float = 5.0,
-    max_workers:   int = 64,
-    pool_cpus:     int = 8,    # ← pool 用パラメータを別名にする
-    pool_gpus:     int = 2,
-    pool_mem_mb:   int = 16384,
-) -> scheduler.Scheduler:
-    """Return a Scheduler with the given kwargs and a pre-loaded pool."""
-    sched = scheduler.Scheduler(
-        poll_interval=poll_interval,
-        aging_factor=aging_factor,
-        max_workers=max_workers,
-    )
-    sched._pool = _make_pool(cpus=pool_cpus, gpus=pool_gpus, mem_mb=pool_mem_mb)
-    return sched
+def _make_scheduler(**kwargs) -> scheduler.Scheduler:
+    """Return a Scheduler with the given kwargs."""
+
+    return scheduler.Scheduler(**kwargs)
+
 
 # --------------------------------------------------------------------------------------
 # Priority ageing tests
@@ -135,27 +125,32 @@ class TestApplyAging:
 
     def test_priority_increases_after_waiting(self):
         job = _make_queued_job(priority=50, wait_hours=1.0)
-        sched = _make_scheduler(poll_interval=3600.0, aging_factor=5.0)
-        # increment = 5.0 * (3600/3600) = 5 → priority = 55
+        sched = _make_scheduler(poll_interval=2.0, aging_factor=5.0)
+
         with database.get_session() as session:
             sched._apply_aging(session, [job])
+
         assert job.priority > 50
 
     def test_priority_capped_at_100(self):
+        # Job has been waiting a very long time.
         job = _make_queued_job(priority=99, wait_hours=1000.0)
-        sched = _make_scheduler(poll_interval=3600.0, aging_factor=100.0)
-        # increment = 100 * (3600/3600) = 100 → min(100, 199) = 100
+        sched = _make_scheduler(poll_interval=2.0, aging_factor=100.0)
+
         with database.get_session() as session:
             sched._apply_aging(session, [job])
+
         assert job.priority == 100
 
     def test_zero_wait_time_no_increase(self):
         job = _make_queued_job(priority=50, wait_hours=0.0)
         sched = _make_scheduler(poll_interval=2.0, aging_factor=5.0)
-        # increment = 5.0 * (2/3600) ≈ 0.0028 → int() = 0 → no change
         original = job.priority
+
         with database.get_session() as session:
             sched._apply_aging(session, [job])
+
+        # Increment = 5.0 * (2.0 / 3600) ≈ 0.0028 → int() → 0
         assert job.priority == original
 
     def test_higher_aging_factor_increases_faster(self):
@@ -200,9 +195,12 @@ class TestEstimateReservationWindow:
     def test_returns_none_when_running_jobs_have_no_walltime(self):
         _make_running_job(req_cpus=4, walltime_sec=None)
         head = _make_queued_job(req_cpus=8)
-        sched = _make_scheduler(pool_cpus=4)
-        sched._pool = _make_pool(cpus=4)
-        sched._pool.free_cpu_ids = []   # All CPUs occupied.
+        # Set used_cpus=4 so free_cpus=0 in DB.
+        with database.get_session() as session:
+            row = session.get(models.Resource, 1)
+            row.total_cpus = 4
+            row.used_cpus = 4
+        sched = _make_scheduler()
         with database.get_session() as session:
             result = sched._estimate_reservation_window(session, head)
         assert result is None
@@ -215,10 +213,13 @@ class TestEstimateReservationWindow:
             started_seconds_ago=600,
         )
         head = _make_queued_job(req_cpus=4)
-        sched = _make_scheduler()
-        sched._pool = _make_pool(cpus=4)
-        sched._pool.free_cpu_ids = []   # All CPUs occupied.
+        # Set used_cpus=4 so free_cpus=0 in DB.
+        with database.get_session() as session:
+            row = session.get(models.Resource, 1)
+            row.total_cpus = 4
+            row.used_cpus = 4
 
+        sched = _make_scheduler()
         with database.get_session() as session:
             result = sched._estimate_reservation_window(session, head)
 
@@ -230,10 +231,13 @@ class TestEstimateReservationWindow:
         _make_running_job(req_cpus=1, walltime_sec=1000, started_seconds_ago=0)
         _make_running_job(req_cpus=1, walltime_sec=2000, started_seconds_ago=0)
         head = _make_queued_job(req_cpus=2)
-        sched = _make_scheduler()
-        sched._pool = _make_pool(cpus=2)
-        sched._pool.free_cpu_ids = []
+        # Set used_cpus=2 so free_cpus=0 in DB.
+        with database.get_session() as session:
+            row = session.get(models.Resource, 1)
+            row.total_cpus = 2
+            row.used_cpus = 2
 
+        sched = _make_scheduler()
         with database.get_session() as session:
             result = sched._estimate_reservation_window(session, head)
 
@@ -319,6 +323,113 @@ class TestFindBackfillJobs:
             slots_remaining=10,
         )
         assert len(result) == 3
+
+
+# --------------------------------------------------------------------------------------
+# Scheduler tick allocation tests
+
+
+class TestTickAllocation:
+    """One scheduler tick must not assign the same CPU/GPU IDs twice."""
+
+    def test_same_tick_cpu_allocations_are_disjoint(self, monkeypatch):
+        launched: list[str] = []
+
+        def _fake_start_job(job, resource_pool):
+            launched.append(job.id)
+
+        monkeypatch.setattr(scheduler.runner, "start_job", _fake_start_job)
+
+        job_a = _make_queued_job(req_cpus=2, req_gpus=0)
+        job_b = _make_queued_job(req_cpus=2, req_gpus=0)
+        with database.get_session() as session:
+            row = session.get(models.Resource, 1)
+            row.total_cpus = 4
+            row.total_gpus = 0
+            row.total_mem_mb = 4096
+
+        sched = _make_scheduler(max_workers=2)
+        asyncio.run(sched._tick())
+
+        with database.get_session() as session:
+            stored_a = session.get(models.Job, job_a.id)
+            stored_b = session.get(models.Job, job_b.id)
+            cpus_a = set(json.loads(stored_a.assigned_cpus))
+            cpus_b = set(json.loads(stored_b.assigned_cpus))
+
+        assert len(launched) == 2
+        assert cpus_a.isdisjoint(cpus_b)
+
+    def test_same_tick_gpu_allocations_are_disjoint(self, monkeypatch):
+        launched: list[str] = []
+
+        def _fake_start_job(job, resource_pool):
+            launched.append(job.id)
+
+        monkeypatch.setattr(scheduler.runner, "start_job", _fake_start_job)
+
+        job_a = _make_queued_job(req_cpus=1, req_gpus=1)
+        job_b = _make_queued_job(req_cpus=1, req_gpus=1)
+        with database.get_session() as session:
+            row = session.get(models.Resource, 1)
+            row.total_cpus = 2
+            row.total_gpus = 2
+            row.total_mem_mb = 4096
+
+        sched = _make_scheduler(max_workers=2)
+        asyncio.run(sched._tick())
+
+        with database.get_session() as session:
+            stored_a = session.get(models.Job, job_a.id)
+            stored_b = session.get(models.Job, job_b.id)
+            gpus_a = set(json.loads(stored_a.assigned_gpus))
+            gpus_b = set(json.loads(stored_b.assigned_gpus))
+
+        assert len(launched) == 2
+        assert gpus_a.isdisjoint(gpus_b)
+
+    def test_launched_job_is_marked_running_in_scheduler_transaction(self, monkeypatch):
+        launched: list[str] = []
+
+        def _fake_start_job(job, resource_pool):
+            launched.append(job.id)
+
+        monkeypatch.setattr(scheduler.runner, "start_job", _fake_start_job)
+
+        job = _make_queued_job(req_cpus=1)
+        with database.get_session() as session:
+            row = session.get(models.Resource, 1)
+            row.total_cpus = 1
+            row.total_mem_mb = 1024
+
+        sched = _make_scheduler(max_workers=1)
+        asyncio.run(sched._tick())
+
+        with database.get_session() as session:
+            stored = session.get(models.Job, job.id)
+            assert stored.status == models.JobStatus.RUNNING
+
+        assert launched == [job.id]
+
+    def test_running_reservation_prevents_second_tick_relaunch(self, monkeypatch):
+        launched: list[str] = []
+
+        def _fake_start_job(job, resource_pool):
+            launched.append(job.id)
+
+        monkeypatch.setattr(scheduler.runner, "start_job", _fake_start_job)
+
+        job = _make_queued_job(req_cpus=1)
+        with database.get_session() as session:
+            row = session.get(models.Resource, 1)
+            row.total_cpus = 1
+            row.total_mem_mb = 1024
+
+        sched = _make_scheduler(max_workers=1)
+        asyncio.run(sched._tick())
+        asyncio.run(sched._tick())
+
+        assert launched == [job.id]
 
 
 # --------------------------------------------------------------------------------------

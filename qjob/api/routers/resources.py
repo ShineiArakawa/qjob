@@ -35,6 +35,7 @@ def get_resources() -> schemas.ResourceResponse:
     """
 
     info = crud.get_resources()
+
     return _info_to_response(info)
 
 

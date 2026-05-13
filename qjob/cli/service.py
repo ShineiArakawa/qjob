@@ -28,13 +28,13 @@ def _async_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(base_url=_api_url(), timeout=_DEFAULT_TIMEOUT)
 
 
-def _run(coro: typing.Coroutine) -> typing.Any:
+def _run(coroutine: typing.Coroutine) -> typing.Any:
     """
     Run a coroutine from synchronous code.
 
     Parameters
     ----------
-    coro : typing.Coroutine
+    coroutine : typing.Coroutine
         The coroutine to execute.
 
     Returns
@@ -43,7 +43,7 @@ def _run(coro: typing.Coroutine) -> typing.Any:
         The return value of the coroutine.
     """
 
-    return asyncio.run(coro)
+    return asyncio.run(coroutine)
 
 
 # --------------------------------------------------------------------------------------
@@ -330,7 +330,7 @@ def set_resources(
 
 async def _async_submit_job(
     script_path: str,
-    user:        str | None,
+    user: str | None,
 ) -> JobInfo:
     """Async implementation of submit_job."""
 

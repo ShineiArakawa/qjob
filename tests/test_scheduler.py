@@ -356,29 +356,32 @@ class TestRecoverInterruptedJobs:
             session.add(orphan)
 
         sched = scheduler.Scheduler()
-        sched._pool = _make_pool()
         sched._recover_interrupted_jobs()
 
         with database.get_session() as session:
             recovered = session.get(models.Job, orphan.id)
             assert recovered.status == models.JobStatus.FAILED
 
-    def test_orphaned_jobs_release_resources(self):
-        pool = _make_pool(cpus=4)
+    def test_orphaned_jobs_release_resources_in_db(self):
+        # Set used_cpus=2 to simulate the orphan occupying 2 cores.
+        with database.get_session() as session:
+            row = session.get(models.Resource, 1)
+            row.total_cpus = 4
+            row.used_cpus = 2
+
         orphan = _make_job(req_cpus=2, status=models.JobStatus.RUNNING)
         orphan.assigned_cpus = json.dumps([0, 1])
         orphan.assigned_gpus = json.dumps([])
         with database.get_session() as session:
             session.add(orphan)
 
-        # Manually mark those CPUs as occupied.
-        pool.free_cpu_ids = [2, 3]
-
         sched = scheduler.Scheduler()
-        sched._pool = pool
         sched._recover_interrupted_jobs()
 
-        assert pool.free_cpus == 4
+        # used_cpus should be 0 after recovery.
+        with database.get_session() as session:
+            row = session.get(models.Resource, 1)
+            assert row.used_cpus == 0
 
 
 # --------------------------------------------------------------------------------------

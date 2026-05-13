@@ -16,6 +16,7 @@ import qjob.core.parser as parser
 class Base(sqlalchemy.orm.DeclarativeBase):
     pass
 
+
 # --------------------------------------------------------------------------------------
 # Enums
 
@@ -98,7 +99,7 @@ class Job(Base):
 
     # -- Status -------------------------------------------------------------------------
     status: sqlalchemy.orm.Mapped[JobStatus] = sqlalchemy.orm.mapped_column(
-        sqlalchemy.Enum(JobStatus),
+        sqlalchemy.String(16),
         nullable=False,
         default=JobStatus.QUEUED,
     )
@@ -122,15 +123,15 @@ class Job(Base):
 
     # -- Timestamps ---------------------------------------------------------------------
     submitted_at: sqlalchemy.orm.Mapped[datetime.datetime] = sqlalchemy.orm.mapped_column(
-        sqlalchemy.DateTime(timezone=True),
+        sqlalchemy.DateTime,
         nullable=False,
         default=lambda: datetime.datetime.now(datetime.timezone.utc),
     )
     started_at: sqlalchemy.orm.Mapped[datetime.datetime | None] = sqlalchemy.orm.mapped_column(
-        sqlalchemy.DateTime(timezone=True), nullable=True
+        sqlalchemy.DateTime, nullable=True
     )
     finished_at: sqlalchemy.orm.Mapped[datetime.datetime | None] = sqlalchemy.orm.mapped_column(
-        sqlalchemy.DateTime(timezone=True), nullable=True
+        sqlalchemy.DateTime, nullable=True
     )
 
     # -- Runtime info -------------------------------------------------------------------
@@ -210,10 +211,12 @@ class Job(Base):
 
 class Resource(Base):
     """
-    Represents the total available resources on this server.
+    Represents the total and currently used resources on this server.
 
-    Only a single row (id=1) is used. Administrators update this row
-    to reflect actual hardware capacity or to reserve resources.
+    Only a single row (id=1) is used.  The ``used_*`` columns are updated
+    atomically inside DB transactions by the scheduler, replacing the
+    in-memory ResourcePool that was used in earlier versions.  This makes
+    resource accounting safe across multiple processes and workers.
 
     Attributes
     ----------
@@ -225,6 +228,12 @@ class Resource(Base):
         Total number of GPU devices available for job scheduling.
     total_mem_mb : int
         Total memory available in megabytes.
+    used_cpus : int
+        CPU cores currently allocated to running jobs.
+    used_gpus : int
+        GPU devices currently allocated to running jobs.
+    used_mem_mb : int
+        Memory currently allocated to running jobs in megabytes.
     updated_at : datetime.datetime
         UTC timestamp of the last update.
     """
@@ -243,15 +252,63 @@ class Resource(Base):
     total_mem_mb: sqlalchemy.orm.Mapped[int] = sqlalchemy.orm.mapped_column(
         sqlalchemy.Integer, nullable=False, default=1024
     )
+    used_cpus: sqlalchemy.orm.Mapped[int] = sqlalchemy.orm.mapped_column(
+        sqlalchemy.Integer, nullable=False, default=0
+    )
+    used_gpus: sqlalchemy.orm.Mapped[int] = sqlalchemy.orm.mapped_column(
+        sqlalchemy.Integer, nullable=False, default=0
+    )
+    used_mem_mb: sqlalchemy.orm.Mapped[int] = sqlalchemy.orm.mapped_column(
+        sqlalchemy.Integer, nullable=False, default=0
+    )
     updated_at: sqlalchemy.orm.Mapped[datetime.datetime] = sqlalchemy.orm.mapped_column(
-        sqlalchemy.DateTime(timezone=True),
+        sqlalchemy.DateTime,
         nullable=False,
         default=lambda: datetime.datetime.now(datetime.timezone.utc),
         onupdate=lambda: datetime.datetime.now(datetime.timezone.utc),
     )
 
+    # -- Properties --------------------------------------------------------------------
+
+    @property
+    def free_cpus(self) -> int:
+        """Number of unallocated CPU cores."""
+        return self.total_cpus - self.used_cpus
+
+    @property
+    def free_gpus(self) -> int:
+        """Number of unallocated GPU devices."""
+        return self.total_gpus - self.used_gpus
+
+    @property
+    def free_mem_mb(self) -> int:
+        """Unallocated memory in megabytes."""
+        return self.total_mem_mb - self.used_mem_mb
+
+    def can_fit(self, job: Job) -> bool:
+        """
+        Return True if this resource row has enough free capacity for *job*.
+
+        Parameters
+        ----------
+        job : Job
+            The job whose resource requirements are checked.
+
+        Returns
+        -------
+        bool
+            True when CPUs, GPUs, and memory can all be satisfied.
+        """
+
+        return (
+            job.req_cpus <= self.free_cpus
+            and job.req_gpus <= self.free_gpus
+            and job.req_mem_mb <= self.free_mem_mb
+        )
+
     def __repr__(self) -> str:
         return (
-            f"<Resource cpus={self.total_cpus} "
-            f"gpus={self.total_gpus} mem_mb={self.total_mem_mb}>"
+            f"<Resource total=({self.total_cpus}cpu/{self.total_gpus}gpu/"
+            f"{self.total_mem_mb}mb) "
+            f"used=({self.used_cpus}cpu/{self.used_gpus}gpu/{self.used_mem_mb}mb)>"
         )

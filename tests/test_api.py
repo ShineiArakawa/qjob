@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import textwrap
 
@@ -15,18 +16,15 @@ import qjob.core.models as models
 # --------------------------------------------------------------------------------------
 # Fixtures
 
-_TEST_DB_URL = "sqlite:///file:qjob_test?mode=memory&cache=shared&uri=true"
-
 
 @pytest.fixture
 def app():
     """
-    Return a FastAPI application wired to the already-initialised in-memory DB.
+    Return a FastAPI application wired to the already-initialised test DB.
 
     The ``isolated_db`` fixture in conftest.py has already called
-    ``database.init_db("sqlite:///:memory:")``.  We pass the same URL here
-    so ``create_app()`` reuses it rather than calling ``init_db()`` again
-    with the default file-based URL.
+    ``database.init_db()`` with ``QJOB_TEST_DB_URL``.  We pass the same URL
+    here so ``create_app()`` reuses it.
 
     Parameters
     ----------
@@ -38,7 +36,7 @@ def app():
         Configured application instance backed by the in-memory DB.
     """
 
-    return server.create_app(db_url=_TEST_DB_URL)
+    return server.create_app(db_url=os.environ["QJOB_DB_URL"])
 
 
 @pytest.fixture
@@ -380,6 +378,8 @@ class TestGetResources:
             stored = session.get(models.Job, job.id)
             stored.assigned_cpus = json.dumps([0, 1, 2, 3])
             stored.assigned_gpus = json.dumps([])
+            resource = session.get(models.Resource, 1)
+            resource.used_cpus = 4
 
         data = client.get("/resources").json()
         assert data["used_cpus"] == 4

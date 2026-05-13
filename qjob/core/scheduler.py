@@ -4,7 +4,6 @@ import asyncio
 import dataclasses
 import json
 import logging
-import math
 import signal
 import threading
 
@@ -268,13 +267,14 @@ class Scheduler:
     def __init__(
         self,
         poll_interval: float = _DEFAULT_POLL_INTERVAL,
-        max_workers:   int = _DEFAULT_MAX_WORKERS,
-        aging_factor:  float = _DEFAULT_AGING_FACTOR,
+        max_workers: int = _DEFAULT_MAX_WORKERS,
+        aging_factor: float = _DEFAULT_AGING_FACTOR,
+        install_signal_handlers: bool = False
     ) -> None:
         self._poll_interval = poll_interval
         self._max_workers = max_workers
         self._aging_factor = aging_factor
-        self._pool:    ResourcePool | None = None
+        self._install_signal_handlers_enabled = install_signal_handlers
         self._running: bool = False
 
     # -- Public API --------------------------------------------------------------------
@@ -295,18 +295,15 @@ class Scheduler:
         None
         """
 
-        self._pool = self._load_resource_pool()
+        self._ensure_resource_row()
         self._running = True
-        self._install_signal_handlers()
+        if self._install_signal_handlers_enabled:
+            self._install_signal_handlers()
 
         logger.info(
-            "Scheduler started — poll_interval=%.1fs  max_workers=%d  "
-            "cpus=%d  gpus=%d  mem=%dMB",
+            "Scheduler started — poll_interval=%.1fs  max_workers=%d",
             self._poll_interval,
             self._max_workers,
-            self._pool.total_cpus,
-            self._pool.total_gpus,
-            self._pool.total_mem_mb,
         )
 
         # Recover any jobs that were RUNNING when the process last stopped.
@@ -343,16 +340,16 @@ class Scheduler:
         """
         Execute one scheduling cycle using EASY Backfill + priority ageing.
 
+        All resource allocation decisions are made inside a single
+        ``get_session_for_update()`` context so that concurrent scheduler
+        processes (or uvicorn workers) cannot double-allocate resources.
+
         Steps
         -----
-        1. Release resources held by newly finished jobs.
-        2. Apply ageing to all queued jobs so long-waiting jobs gain priority.
+        1. Lock the resources row and release resources held by finished jobs.
+        2. Apply ageing to queued jobs.
         3. Re-sort the queue by effective priority DESC, submitted_at ASC.
-        4. Try to run the head job (highest effective priority).
-           - If the head job fits: launch it and continue down the queue.
-           - If the head job does not fit: estimate when it can start
-             (``reservation_window``), then scan the remaining queue for
-             backfill candidates whose walltime fits within that window.
+        4. Try to run the head job; fall back to EASY Backfill when blocked.
         5. Repeat until the worker slot limit is reached.
 
         Parameters
@@ -364,51 +361,58 @@ class Scheduler:
         None
         """
 
-        with database.get_session() as session:
+        with database.get_session_for_update() as session:
             running_count = self._count_running(session)
             slots = self._max_workers - running_count
             if slots <= 0:
                 return
 
+            # Release resources for finished jobs and update DB counts.
             self._release_finished_jobs(session)
 
             candidates = self._fetch_queued(session)
             if not candidates:
                 return
 
-            # Apply ageing so waiting jobs gain priority over time.
             self._apply_aging(session, candidates)
 
-            # Re-sort after ageing: effective_priority DESC, submitted_at ASC.
             candidates.sort(
                 key=lambda j: (-self._effective_priority(j), j.submitted_at or 0)
             )
 
             dispatched = 0
             launched_ids: set[str] = set()
+            reserved_cpu_ids: set[int] = set()
+            reserved_gpu_ids: set[int] = set()
 
             for head_idx, head in enumerate(candidates):
                 if dispatched >= slots:
                     break
                 if head.id in launched_ids:
                     continue
-                if self._pool is None:
+
+                resource_row = session.get(models.Resource, 1)
+                if resource_row is None:
                     break
 
-                if self._pool.can_fit(head):
-                    cpu_ids, gpu_ids = self._pool.allocate(head)
+                if resource_row.can_fit(head):
+                    cpu_ids, gpu_ids = self._allocate_db(
+                        session,
+                        resource_row,
+                        head,
+                        reserved_cpu_ids=reserved_cpu_ids,
+                        reserved_gpu_ids=reserved_gpu_ids,
+                    )
                     self._launch(session, head, cpu_ids, gpu_ids)
                     launched_ids.add(head.id)
+                    reserved_cpu_ids.update(cpu_ids)
+                    reserved_gpu_ids.update(gpu_ids)
                     dispatched += 1
                 else:
-                    # Head job cannot run now.  Estimate the earliest time
-                    # its resources will be available (reservation window).
                     reservation_sec = self._estimate_reservation_window(session, head)
                     if reservation_sec is None:
-                        # Cannot estimate: skip backfill for this head job.
                         continue
 
-                    # Scan remaining candidates for backfill opportunities.
                     backfill = self._find_backfill_jobs(
                         candidates=candidates[head_idx + 1:],
                         launched_ids=launched_ids,
@@ -416,10 +420,21 @@ class Scheduler:
                         slots_remaining=slots - dispatched,
                     )
                     for bf_job in backfill:
-                        if self._pool.can_fit(bf_job):
-                            cpu_ids, gpu_ids = self._pool.allocate(bf_job)
+                        resource_row = session.get(models.Resource, 1)
+                        if resource_row is None:
+                            break
+                        if resource_row.can_fit(bf_job):
+                            cpu_ids, gpu_ids = self._allocate_db(
+                                session,
+                                resource_row,
+                                bf_job,
+                                reserved_cpu_ids=reserved_cpu_ids,
+                                reserved_gpu_ids=reserved_gpu_ids,
+                            )
                             self._launch(session, bf_job, cpu_ids, gpu_ids)
                             launched_ids.add(bf_job.id)
+                            reserved_cpu_ids.update(cpu_ids)
+                            reserved_gpu_ids.update(gpu_ids)
                             dispatched += 1
                             logger.info(
                                 "Backfilled job %s (walltime=%ss, window=%ss).",
@@ -443,20 +458,21 @@ class Scheduler:
     def _release_finished_jobs(self, session: sqlalchemy.orm.Session) -> None:
         """
         Find jobs that have transitioned to a terminal state since the last
-        tick and return their resources to the pool.
+        tick and return their resources to the DB resource row.
+
+        This replaces the former in-memory ``ResourcePool.release()`` call.
+        The resources row is already locked by ``get_session_for_update()``
+        when this method is called from ``_tick()``.
 
         Parameters
         ----------
         session : sqlalchemy.orm.Session
-            An open DB session.
+            An open DB session with the resources row locked.
 
         Returns
         -------
         None
         """
-
-        if self._pool is None:
-            return
 
         terminal = (
             session.query(models.Job)
@@ -470,8 +486,19 @@ class Scheduler:
             )
             .all()
         )
+        if not terminal:
+            return
+
+        resource_row = session.get(models.Resource, 1)
+        if resource_row is None:
+            return
+
         for job in terminal:
-            self._pool.release(job)
+            cpu_ids: list[int] = json.loads(job.assigned_cpus) if job.assigned_cpus else []
+            gpu_ids: list[int] = json.loads(job.assigned_gpus) if job.assigned_gpus else []
+            resource_row.used_cpus = max(0, resource_row.used_cpus - len(cpu_ids))
+            resource_row.used_gpus = max(0, resource_row.used_gpus - len(gpu_ids))
+            resource_row.used_mem_mb = max(0, resource_row.used_mem_mb - job.req_mem_mb)
             # Clear assigned fields so we don't release the same resources twice.
             job.assigned_cpus = None
             job.assigned_gpus = None
@@ -558,15 +585,13 @@ class Scheduler:
                 continue
 
             submitted = job.submitted_at
-            # SQLite returns naive datetimes; attach UTC so subtraction works.
+            # Some DB drivers may return naive datetimes; attach UTC so subtraction works.
             if submitted.tzinfo is None:
                 submitted = submitted.replace(tzinfo=datetime.timezone.utc)
 
             wait_hours = (now - submitted).total_seconds() / 3600.0
-            increment = self._aging_factor * (self._poll_interval / 3600.0)
-            delta = int(increment)
-            if delta > 0:
-                job.priority = min(100, job.priority + delta)
+            increment = self._aging_factor * wait_hours
+            job.priority = min(100, int(job.priority + increment))
 
     def _estimate_reservation_window(
         self,
@@ -629,9 +654,10 @@ class Scheduler:
         # earliest point at which head's requirements can be satisfied.
         finish_events.sort(key=lambda e: e[0])
 
-        sim_free_cpus = self._pool.free_cpus if self._pool else 0
-        sim_free_gpus = self._pool.free_gpus if self._pool else 0
-        sim_free_mem = self._pool.free_mem_mb if self._pool else 0
+        resource_row = session.get(models.Resource, 1)
+        sim_free_cpus = resource_row.free_cpus if resource_row else 0
+        sim_free_gpus = resource_row.free_gpus if resource_row else 0
+        sim_free_mem = resource_row.free_mem_mb if resource_row else 0
 
         for finish_sec, cpus, gpus, mem in finish_events:
             sim_free_cpus += cpus
@@ -695,6 +721,73 @@ class Scheduler:
 
         return result
 
+    def _allocate_db(
+        self,
+        session:          sqlalchemy.orm.Session,
+        resource_row:     models.Resource,
+        job:              models.Job,
+        reserved_cpu_ids: set[int] | None = None,
+        reserved_gpu_ids: set[int] | None = None,
+    ) -> tuple[list[int], list[int]]:
+        """
+        Assign CPU and GPU IDs to *job* and update the DB resource counts.
+
+        CPU IDs are chosen from the set that are not currently in use by any
+        RUNNING job.  The resource row's ``used_*`` counters are incremented
+        atomically within the locked transaction started by
+        ``get_session_for_update()``.
+
+        Parameters
+        ----------
+        session : sqlalchemy.orm.Session
+            Open DB session (resources row is already locked).
+        resource_row : models.Resource
+            The locked resource row to update.
+        job : models.Job
+            The job to allocate resources for.
+        reserved_cpu_ids : set[int] | None
+            CPU IDs already assigned earlier in the current scheduler tick.
+        reserved_gpu_ids : set[int] | None
+            GPU IDs already assigned earlier in the current scheduler tick.
+
+        Returns
+        -------
+        tuple[list[int], list[int]]
+            ``(cpu_ids, gpu_ids)`` of the assigned resource indices.
+        """
+
+        # Determine which CPU/GPU IDs are already in use, including jobs
+        # launched earlier in this tick that are not RUNNING in the DB yet.
+        occupied_cpus: set[int] = set(reserved_cpu_ids or set())
+        occupied_gpus: set[int] = set(reserved_gpu_ids or set())
+        running_jobs = (
+            session.query(models.Job)
+            .filter(models.Job.status == models.JobStatus.RUNNING)
+            .all()
+        )
+        for rj in running_jobs:
+            if rj.assigned_cpus:
+                occupied_cpus.update(json.loads(rj.assigned_cpus))
+            if rj.assigned_gpus:
+                occupied_gpus.update(json.loads(rj.assigned_gpus))
+
+        free_cpus = [
+            i for i in range(resource_row.total_cpus) if i not in occupied_cpus
+        ]
+        free_gpus = [
+            i for i in range(resource_row.total_gpus) if i not in occupied_gpus
+        ]
+
+        cpu_ids = free_cpus[:job.req_cpus]
+        gpu_ids = free_gpus[:job.req_gpus]
+
+        # Update counters atomically.
+        resource_row.used_cpus += len(cpu_ids)
+        resource_row.used_gpus += len(gpu_ids)
+        resource_row.used_mem_mb += job.req_mem_mb
+
+        return cpu_ids, gpu_ids
+
     def _launch(
         self,
         session:  sqlalchemy.orm.Session,
@@ -703,7 +796,11 @@ class Scheduler:
         gpu_ids:  list[int],
     ) -> None:
         """
-        Persist the resource assignment and hand the job off to the runner.
+        Persist the resource assignment, reserve the job by moving it out of
+        QUEUED, and hand it off to the runner.
+
+        When the runner fails to start the process the DB resource counters
+        are decremented so the allocation is rolled back.
 
         Parameters
         ----------
@@ -712,9 +809,9 @@ class Scheduler:
         job : models.Job
             The job to launch.
         cpu_ids : list[int]
-            CPU core indices assigned by the resource pool.
+            CPU core indices returned by ``_allocate_db()``.
         gpu_ids : list[int]
-            GPU device indices assigned by the resource pool.
+            GPU device indices returned by ``_allocate_db()``.
 
         Returns
         -------
@@ -723,9 +820,10 @@ class Scheduler:
 
         job.assigned_cpus = json.dumps(cpu_ids)
         job.assigned_gpus = json.dumps(gpu_ids)
+        job.status = models.JobStatus.RUNNING
 
         try:
-            runner.start_job(job, self._pool)
+            runner.start_job(job, None)
             logger.info(
                 "Launched job %s (user=%s name=%s cpus=%s gpus=%s).",
                 job.id, job.user, job.name, cpu_ids, gpu_ids,
@@ -735,15 +833,24 @@ class Scheduler:
             job.status = models.JobStatus.FAILED
             job.assigned_cpus = None
             job.assigned_gpus = None
-            if self._pool:
-                self._pool.release(job)
+            # Roll back the resource counters.
+            resource_row = session.get(models.Resource, 1)
+            if resource_row is not None:
+                resource_row.used_cpus = max(0, resource_row.used_cpus - len(cpu_ids))
+                resource_row.used_gpus = max(0, resource_row.used_gpus - len(gpu_ids))
+                resource_row.used_mem_mb = max(0, resource_row.used_mem_mb - job.req_mem_mb)
 
     # -- Startup helpers ---------------------------------------------------------------
 
     @staticmethod
-    def _load_resource_pool() -> ResourcePool:
+    def _ensure_resource_row() -> None:
         """
-        Read the resource configuration from the DB and return a ResourcePool.
+        Verify that the resources row (id=1) exists in the DB.
+
+        Raises
+        ------
+        RuntimeError
+            If no resource row is found.
 
         Parameters
         ----------
@@ -751,13 +858,7 @@ class Scheduler:
 
         Returns
         -------
-        ResourcePool
-            Pool initialised with all resources free.
-
-        Raises
-        ------
-        RuntimeError
-            If no resource row exists in the database.
+        None
         """
 
         with database.get_session() as session:
@@ -766,17 +867,16 @@ class Scheduler:
                 raise RuntimeError(
                     "No resource row found. Run 'alembic upgrade head' first."
                 )
-            return ResourcePool.from_resource_row(row)
 
     def _recover_interrupted_jobs(self) -> None:
         """
         Mark any RUNNING jobs left over from a previous crash as FAILED and
-        release their resources.
+        return their resources to the DB resource row.
 
-        When the scheduler process exits unexpectedly, jobs that were RUNNING
-        in the DB are orphaned — their subprocesses are gone but the DB still
-        shows them as RUNNING.  This method resets them to FAILED so they
-        are visible to users and do not block resource accounting.
+        When the scheduler process exits unexpectedly jobs that were RUNNING
+        in the DB are orphaned — their subprocesses are gone but the status
+        still shows RUNNING.  This method resets them to FAILED and
+        decrements ``resources.used_*`` so the counts are consistent.
 
         Parameters
         ----------
@@ -787,19 +887,28 @@ class Scheduler:
         None
         """
 
-        with database.get_session() as session:
+        with database.get_session_for_update() as session:
             orphans = (
                 session.query(models.Job)
                 .filter(models.Job.status == models.JobStatus.RUNNING)
                 .all()
             )
+            if not orphans:
+                return
+
+            resource_row = session.get(models.Resource, 1)
+
             for job in orphans:
                 logger.warning(
                     "Recovering orphaned job %s (user=%s name=%s) -> FAILED.",
                     job.id, job.user, job.name,
                 )
-                if self._pool:
-                    self._pool.release(job)
+                if resource_row is not None:
+                    cpu_ids = json.loads(job.assigned_cpus) if job.assigned_cpus else []
+                    gpu_ids = json.loads(job.assigned_gpus) if job.assigned_gpus else []
+                    resource_row.used_cpus = max(0, resource_row.used_cpus - len(cpu_ids))
+                    resource_row.used_gpus = max(0, resource_row.used_gpus - len(gpu_ids))
+                    resource_row.used_mem_mb = max(0, resource_row.used_mem_mb - job.req_mem_mb)
                 job.status = models.JobStatus.FAILED
                 job.assigned_cpus = None
                 job.assigned_gpus = None

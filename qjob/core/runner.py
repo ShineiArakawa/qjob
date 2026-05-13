@@ -153,6 +153,7 @@ async def _spawn(
             stdout=fout,
             stderr=ferr,
             env=env,
+            start_new_session=True,
         )
 
     logger.debug(
@@ -229,10 +230,12 @@ def _send_signal(process: asyncio.subprocess.Process, sig: signal.Signals) -> No
     """
 
     try:
-        process.send_signal(sig)
+        if os.name == "posix":
+            os.killpg(process.pid, sig)
+        else:
+            process.send_signal(sig)
     except ProcessLookupError:
         pass
-
 
 # --------------------------------------------------------------------------------------
 # Environment helpers
@@ -352,9 +355,15 @@ def _mark_finished(
         stored = session.get(models.Job, job.id)
         if stored is None:
             return
-        stored.status = final_status
-        stored.exit_code = exit_code
-        stored.finished_at = now
+
+        if stored.status == models.JobStatus.CANCELLED:
+            stored.exit_code = exit_code
+            stored.finished_at = stored.finished_at or now
+            final_status = models.JobStatus.CANCELLED
+        else:
+            stored.status = final_status
+            stored.exit_code = exit_code
+            stored.finished_at = now
 
     job.status = final_status
 

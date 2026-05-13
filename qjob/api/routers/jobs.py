@@ -133,6 +133,7 @@ def get_job(job_id: str) -> schemas.JobResponse:
         raise fastapi.HTTPException(
             status_code=404, detail=f"Job {job_id!r} not found."
         )
+
     return _info_to_response(info)
 
 
@@ -185,6 +186,7 @@ def cancel_job(
         raise fastapi.HTTPException(
             status_code=404, detail=f"Job {job_id!r} not found."
         )
+
     return _info_to_response(info)
 
 

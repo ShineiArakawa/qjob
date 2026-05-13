@@ -4,7 +4,9 @@ import dataclasses
 import datetime
 import getpass
 import json
+import os
 import pathlib
+import signal
 
 import sqlalchemy.orm
 
@@ -252,9 +254,19 @@ def cancel_job(job_id: str, user: str | None = None) -> JobInfo | None:
             models.JobStatus.CANCELLED,
         }
         if job.status in terminal:
+            job_status = job.status.value if isinstance(job.status, models.JobStatus) else job.status
             raise ValueError(
-                f"Job {job_id!r} is already in terminal state {job.status.value!r}."
+                f"Job {job_id!r} is already in terminal state {job_status!r}."
             )
+
+        if job.status == models.JobStatus.RUNNING and job.pid is not None:
+            try:
+                if os.name == "posix":
+                    os.killpg(job.pid, signal.SIGTERM)
+                else:
+                    os.kill(job.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
 
         job.status = models.JobStatus.CANCELLED
         job.finished_at = datetime.datetime.now(datetime.timezone.utc)
@@ -313,6 +325,9 @@ def get_resources() -> ResourceInfo:
     """
     Return the current resource configuration and usage summary.
 
+    Usage counts are read from the ``resources`` table which is kept
+    up-to-date by the scheduler via atomic DB transactions.
+
     Parameters
     ----------
     None
@@ -331,15 +346,13 @@ def get_resources() -> ResourceInfo:
                 used_cpus=0,  used_gpus=0,  used_mem_mb=0,
             )
 
-        used_cpus, used_gpus, used_mem_mb = _compute_usage(session)
-
         return ResourceInfo(
             total_cpus=row.total_cpus,
             total_gpus=row.total_gpus,
             total_mem_mb=row.total_mem_mb,
-            used_cpus=used_cpus,
-            used_gpus=used_gpus,
-            used_mem_mb=used_mem_mb,
+            used_cpus=row.used_cpus,
+            used_gpus=row.used_gpus,
+            used_mem_mb=row.used_mem_mb,
         )
 
 
@@ -389,15 +402,13 @@ def set_resources(
 
         row.updated_at = datetime.datetime.now(datetime.timezone.utc)
 
-        used_cpus, used_gpus, used_mem_mb = _compute_usage(session)
-
         return ResourceInfo(
             total_cpus=row.total_cpus,
             total_gpus=row.total_gpus,
             total_mem_mb=row.total_mem_mb,
-            used_cpus=used_cpus,
-            used_gpus=used_gpus,
-            used_mem_mb=used_mem_mb,
+            used_cpus=row.used_cpus,
+            used_gpus=row.used_gpus,
+            used_mem_mb=row.used_mem_mb,
         )
 
 

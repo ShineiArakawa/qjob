@@ -244,7 +244,7 @@ def dash(
     """
 
     database.init_db()
-    dashboard.run_dashboard(refresh_interval=refresh)
+    dashboard.run(refresh_interval=refresh)
 
 
 # --------------------------------------------------------------------------------------

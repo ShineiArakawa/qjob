@@ -8,6 +8,7 @@ dependencies = [
     "alembic>=1.18.4",
     "fastapi>=0.136.1",
     "httpx>=0.28.1",
+    "psycopg[binary]>=3.2",
     "pydantic>=2.13.4",
     "pytest>=9.0.3",
     "rich>=15.0.0",
