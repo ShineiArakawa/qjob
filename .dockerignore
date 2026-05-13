@@ -1,0 +1,42 @@
+# Python artifacts
+__pycache__/
+*.py[codz]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+build/
+
+# Virtual environments
+.venv/
+.pixi/
+
+# Version control
+.git/
+.gitignore
+
+# Tests and examples (not needed in the image)
+tests/
+examples/
+
+# Docker files (avoid recursive context)
+docker/
+
+# Editor / IDE
+.vscode/
+.idea/
+
+# OS metadata
+.DS_Store
+
+# Database and log files
+*.db
+*.log
+
+# Environment files
+.env
+.envrc
+
+# uv lock file (excluded from git; install from pyproject.toml instead)
+uv.lock
