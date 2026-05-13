@@ -8,6 +8,7 @@ import textwrap
 import pytest
 from fastapi.testclient import TestClient
 
+import qjob.api.crud as crud
 import qjob.api.server as server
 import qjob.cli.service as service
 import qjob.core.database as database
@@ -218,6 +219,39 @@ class TestListJobs:
         data = client.get("/jobs").json()
         assert data["total"] == len(data["jobs"])
 
+    def test_limit_restricts_returned_jobs_but_not_total(self, client):
+        _persist_job(name="job-a")
+        _persist_job(name="job-b")
+        _persist_job(name="job-c")
+
+        data = client.get("/jobs", params={"limit": 2}).json()
+
+        assert data["total"] == 3
+        assert len(data["jobs"]) == 2
+        assert data["limit"] == 2
+        assert data["offset"] == 0
+
+    def test_offset_skips_matching_jobs(self, client):
+        _persist_job(name="oldest")
+        _persist_job(name="middle")
+        _persist_job(name="newest")
+
+        first_page = client.get("/jobs", params={"limit": 1, "offset": 0}).json()
+        second_page = client.get("/jobs", params={"limit": 1, "offset": 1}).json()
+
+        assert first_page["total"] == 3
+        assert second_page["total"] == 3
+        assert first_page["jobs"][0]["id"] != second_page["jobs"][0]["id"]
+        assert second_page["offset"] == 1
+
+    def test_invalid_limit_returns_422(self, client):
+        response = client.get("/jobs", params={"limit": 0})
+        assert response.status_code == 422
+
+    def test_invalid_offset_returns_422(self, client):
+        response = client.get("/jobs", params={"offset": -1})
+        assert response.status_code == 422
+
 
 # --------------------------------------------------------------------------------------
 # GET /jobs/{job_id}
@@ -348,6 +382,27 @@ class TestGetLog:
         response = client.get(f"/jobs/{job.id}/log", params={"stream": "invalid"})
         assert response.status_code == 400
 
+    def test_log_response_is_limited_to_tail(self, client, tmp_path):
+        log_file = tmp_path / "stdout.log"
+        log_file.write_text("old content\n" + ("x" * 128) + "new content\n")
+        job = _persist_job()
+        with database.get_session() as session:
+            stored = session.get(models.Job, job.id)
+            stored.log_stdout = str(log_file)
+
+        data = client.get(
+            f"/jobs/{job.id}/log", params={"max_bytes": 32}
+        ).json()
+
+        assert "log truncated" in data["content"]
+        assert "new content" in data["content"]
+        assert "old content" not in data["content"]
+
+    def test_invalid_max_bytes_returns_422(self, client):
+        job = _persist_job()
+        response = client.get(f"/jobs/{job.id}/log", params={"max_bytes": 0})
+        assert response.status_code == 422
+
     def test_response_contains_stream_field(self, client):
         job = _persist_job()
         data = client.get(f"/jobs/{job.id}/log").json()
@@ -416,12 +471,32 @@ class TestUpdateResources:
         response = client.put("/resources", json={})
         assert response.status_code == 422
 
+    def test_zero_cpus_returns_422(self, client):
+        response = client.put("/resources", json={"total_cpus": 0})
+        assert response.status_code == 422
+
+    def test_negative_gpus_returns_422(self, client):
+        response = client.put("/resources", json={"total_gpus": -1})
+        assert response.status_code == 422
+
+    def test_zero_mem_returns_422(self, client):
+        response = client.put("/resources", json={"total_mem_mb": 0})
+        assert response.status_code == 422
+
     def test_partial_update_preserves_other_fields(self, client):
         client.put("/resources", json={"total_cpus": 8, "total_gpus": 2})
         client.put("/resources", json={"total_cpus": 16})
         data = client.get("/resources").json()
         assert data["total_cpus"] == 16
         assert data["total_gpus"] == 2
+
+    def test_crud_rejects_invalid_resource_limits(self):
+        with pytest.raises(ValueError, match="total_cpus"):
+            crud.set_resources(total_cpus=0)
+        with pytest.raises(ValueError, match="total_gpus"):
+            crud.set_resources(total_gpus=-1)
+        with pytest.raises(ValueError, match="total_mem_mb"):
+            crud.set_resources(total_mem_mb=0)
 
 
 # --------------------------------------------------------------------------------------

@@ -7,6 +7,7 @@ import typing
 import sqlalchemy
 import sqlalchemy.engine
 import sqlalchemy.orm
+import sqlalchemy.pool
 
 import qjob.core.models as models
 
@@ -23,11 +24,38 @@ _SessionFactory: sqlalchemy.orm.sessionmaker | None = None
 # Dialect helpers
 
 _IS_POSTGRES_PREFIXES = ("postgresql", "postgres")
+_POOL_ENABLED_ENV = "QJOB_DB_POOL_ENABLED"
+_POOL_SIZE_ENV = "QJOB_DB_POOL_SIZE"
+_MAX_OVERFLOW_ENV = "QJOB_DB_MAX_OVERFLOW"
 
 
 def _is_postgres(url: str) -> bool:
     """Return True when *url* targets a PostgreSQL database."""
     return any(url.startswith(p) for p in _IS_POSTGRES_PREFIXES)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Parse a boolean environment variable."""
+
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    """Parse a positive integer environment variable."""
+
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise RuntimeError(f"{name} must be an integer, got {raw!r}.")
+    if value <= 0:
+        raise RuntimeError(f"{name} must be greater than 0, got {value}.")
+    return value
 
 
 # --------------------------------------------------------------------------------------
@@ -41,9 +69,10 @@ def init_db(url: str | None = None) -> sqlalchemy.engine.Engine:
     This function is idempotent: calling it multiple times with the same URL
     has no effect after the first call.
 
-    The engine uses a connection pool suitable for multi-process deployments
-    (``NullPool`` is avoided so connections are reused). Schema creation and
-    upgrades are handled by Alembic, not by this function.
+    The engine uses ``NullPool`` by default so multi-process API deployments
+    do not multiply idle database connections. Set ``QJOB_DB_POOL_ENABLED=1``
+    to opt into a per-process QueuePool. Schema creation and upgrades are
+    handled by Alembic, not by this function.
 
     Parameters
     ----------
@@ -86,12 +115,7 @@ def init_db(url: str | None = None) -> sqlalchemy.engine.Engine:
             )
         return _engine
 
-    engine_kwargs: dict = {
-        "echo": False,
-        "pool_size": 10,
-        "max_overflow": 20,
-        "pool_pre_ping": True,
-    }
+    engine_kwargs = _engine_kwargs()
 
     _engine = sqlalchemy.create_engine(resolved_url, **engine_kwargs)
     _SessionFactory = sqlalchemy.orm.sessionmaker(
@@ -105,6 +129,21 @@ def init_db(url: str | None = None) -> sqlalchemy.engine.Engine:
     _ensure_default_resource()
 
     return _engine
+
+
+def _engine_kwargs() -> dict:
+    """Return SQLAlchemy engine options derived from environment settings."""
+
+    kwargs: dict = {
+        "echo": False,
+        "pool_pre_ping": True,
+    }
+    if _env_bool(_POOL_ENABLED_ENV, default=False):
+        kwargs["pool_size"] = _env_positive_int(_POOL_SIZE_ENV, 5)
+        kwargs["max_overflow"] = _env_positive_int(_MAX_OVERFLOW_ENV, 5)
+    else:
+        kwargs["poolclass"] = sqlalchemy.pool.NullPool
+    return kwargs
 
 
 def get_engine() -> sqlalchemy.engine.Engine:

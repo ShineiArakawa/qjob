@@ -88,10 +88,16 @@ class JobListResponse(pydantic.BaseModel):
         The matching jobs.
     total : int
         Total number of matching jobs (before pagination).
+    limit : int
+        Maximum page size requested.
+    offset : int
+        Number of matching rows skipped.
     """
 
-    jobs:  list[JobResponse]
-    total: int
+    jobs:   list[JobResponse]
+    total:  int
+    limit:  int
+    offset: int
 
 
 class JobLogResponse(pydantic.BaseModel):
@@ -161,9 +167,9 @@ class ResourceUpdateRequest(pydantic.BaseModel):
         New total memory in megabytes.
     """
 
-    total_cpus:   int | None = None
-    total_gpus:   int | None = None
-    total_mem_mb: int | None = None
+    total_cpus: int | None = pydantic.Field(default=None, gt=0)
+    total_gpus: int | None = pydantic.Field(default=None, ge=0)
+    total_mem_mb: int | None = pydantic.Field(default=None, gt=0)
 
     @pydantic.model_validator(mode="after")
     def at_least_one_field(self) -> ResourceUpdateRequest:

@@ -67,9 +67,9 @@ def create_app(db_url: str | None = None) -> fastapi.FastAPI:
             _sched.stop()
 
             try:
-                await asyncio.wait_for(task, timeout=10.0)
+                await asyncio.wait_for(task, timeout=15.0)
             except asyncio.TimeoutError:
-                logger.warning("Scheduler did not stop within 10s; cancelling task.")
+                logger.warning("Scheduler did not stop within 15s; cancelling task.")
                 task.cancel()
 
             logger.info("Scheduler stopped.")

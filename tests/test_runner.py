@@ -363,3 +363,30 @@ class TestRunJobEndToEnd:
             stored = session.get(models.Job, job.id)
             log_content = pathlib.Path(stored.log_stdout).read_text()
             assert f"JOB_ID={job.id}" in log_content
+
+    @_skip_subprocess
+    def test_shutdown_active_jobs_terminates_running_process(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("QJOB_LOG_DIR", str(tmp_path))
+        script = _make_script(tmp_path, """\
+            #!/bin/bash
+            sleep 60
+        """)
+        job = _make_job(script_path=str(script))
+        pool = _make_pool()
+
+        async def _run():
+            runner.start_job(job, pool)
+            for _ in range(50):
+                if job.id in runner._active_processes:
+                    break
+                await asyncio.sleep(0.05)
+            assert job.id in runner._active_processes
+            await runner.shutdown_active_jobs(grace_sec=0.2)
+
+        asyncio.run(_run())
+
+        assert job.id not in runner._active_processes
+        with database.get_session() as session:
+            stored = session.get(models.Job, job.id)
+            assert stored.status == models.JobStatus.FAILED
+            assert stored.exit_code != 0

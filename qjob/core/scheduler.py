@@ -316,6 +316,13 @@ class Scheduler:
                 logger.exception("Unhandled error in scheduler tick.")
             await asyncio.sleep(self._poll_interval)
 
+        await runner.shutdown_active_jobs()
+        try:
+            with database.get_session_for_update() as session:
+                self._release_finished_jobs(session)
+        except Exception:
+            logger.exception("Failed to release resources during scheduler shutdown.")
+
         logger.info("Scheduler stopped.")
 
     def stop(self) -> None:

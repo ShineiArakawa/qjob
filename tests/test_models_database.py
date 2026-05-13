@@ -173,6 +173,33 @@ class TestInitDb:
         with pytest.raises(RuntimeError, match="already called"):
             database.init_db("postgresql+psycopg://qjob:password@localhost:5432/other")
 
+    def test_default_engine_uses_null_pool(self):
+        engine = database.get_engine()
+        assert isinstance(engine.pool, sqlalchemy.pool.NullPool)
+
+    def test_pool_can_be_enabled_explicitly(self, monkeypatch):
+        database.reset_db()
+        monkeypatch.setenv("QJOB_DB_POOL_ENABLED", "1")
+        monkeypatch.setenv("QJOB_DB_POOL_SIZE", "2")
+        monkeypatch.setenv("QJOB_DB_MAX_OVERFLOW", "3")
+
+        engine = database.init_db(os.environ["QJOB_DB_URL"])
+
+        assert isinstance(engine.pool, sqlalchemy.pool.QueuePool)
+        assert engine.pool.size() == 2
+        assert engine.pool._max_overflow == 3
+
+    def test_invalid_pool_size_raises(self, monkeypatch):
+        database.reset_db()
+        monkeypatch.setenv("QJOB_DB_POOL_ENABLED", "1")
+        monkeypatch.setenv("QJOB_DB_POOL_SIZE", "0")
+
+        with pytest.raises(RuntimeError, match="QJOB_DB_POOL_SIZE"):
+            database.init_db(os.environ["QJOB_DB_URL"])
+
+        monkeypatch.delenv("QJOB_DB_POOL_ENABLED")
+        monkeypatch.delenv("QJOB_DB_POOL_SIZE")
+
 
 # --------------------------------------------------------------------------------------
 # database.get_engine tests

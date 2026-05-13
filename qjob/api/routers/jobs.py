@@ -66,6 +66,17 @@ def submit_job(body: schemas.JobSubmitRequest) -> schemas.JobResponse:
 def list_jobs(
     user:   typing.Optional[str] = fastapi.Query(None, description="Filter by username."),
     status: typing.Optional[str] = fastapi.Query(None, description="Filter by status."),
+    limit:  int = fastapi.Query(
+        crud.DEFAULT_JOB_LIST_LIMIT,
+        ge=1,
+        le=crud.MAX_JOB_LIST_LIMIT,
+        description="Maximum number of jobs to return.",
+    ),
+    offset: int = fastapi.Query(
+        0,
+        ge=0,
+        description="Number of matching jobs to skip.",
+    ),
 ) -> schemas.JobListResponse:
     """
     Return jobs optionally filtered by user and/or status.
@@ -76,6 +87,10 @@ def list_jobs(
         When given, only jobs submitted by this user are returned.
     status : str | None
         When given, only jobs in this status are returned.
+    limit : int
+        Maximum number of jobs to return.
+    offset : int
+        Number of matching jobs to skip.
 
     Returns
     -------
@@ -89,13 +104,15 @@ def list_jobs(
     """
 
     try:
-        jobs = crud.list_jobs(user=user, status=status)
+        page = crud.list_jobs(user=user, status=status, limit=limit, offset=offset)
     except ValueError as exc:
         raise fastapi.HTTPException(status_code=400, detail=str(exc))
 
     return schemas.JobListResponse(
-        jobs=[_info_to_response(j) for j in jobs],
-        total=len(jobs),
+        jobs=[_info_to_response(j) for j in page.jobs],
+        total=page.total,
+        limit=page.limit,
+        offset=page.offset,
     )
 
 
@@ -202,6 +219,12 @@ def cancel_job(
 def get_log(
     job_id: str,
     stream: str = fastapi.Query("stdout", description="Log stream: stdout or stderr."),
+    max_bytes: int = fastapi.Query(
+        crud.DEFAULT_LOG_MAX_BYTES,
+        ge=1,
+        le=crud.MAX_LOG_MAX_BYTES,
+        description="Maximum bytes to return from the end of the log.",
+    ),
 ) -> schemas.JobLogResponse:
     """
     Return the log content for a job.
@@ -212,6 +235,8 @@ def get_log(
         UUID of the job.
     stream : str
         Which log stream to read: ``"stdout"`` or ``"stderr"``.
+    max_bytes : int
+        Maximum bytes to return from the end of the log.
 
     Returns
     -------
@@ -225,7 +250,7 @@ def get_log(
     """
 
     try:
-        content = crud.get_log(job_id, stream=stream)
+        content = crud.get_log(job_id, stream=stream, max_bytes=max_bytes)
     except ValueError as exc:
         raise fastapi.HTTPException(status_code=400, detail=str(exc))
 

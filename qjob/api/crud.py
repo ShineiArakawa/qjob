@@ -15,6 +15,14 @@ import qjob.core.models as models
 import qjob.core.parser as parser
 
 # --------------------------------------------------------------------------------------
+# Constants
+
+DEFAULT_LOG_MAX_BYTES: int = 1024 * 1024
+MAX_LOG_MAX_BYTES:     int = 16 * 1024 * 1024
+DEFAULT_JOB_LIST_LIMIT: int = 100
+MAX_JOB_LIST_LIMIT:     int = 1000
+
+# --------------------------------------------------------------------------------------
 # Return value data classes
 #
 # These data classes are the public contract of the CRUD layer.
@@ -103,6 +111,29 @@ class ResourceInfo:
     used_mem_mb:  int
 
 
+@dataclasses.dataclass
+class JobListPage:
+    """
+    Paginated job query result.
+
+    Attributes
+    ----------
+    jobs : list[JobInfo]
+        Jobs in the requested page.
+    total : int
+        Total matching jobs before pagination.
+    limit : int
+        Maximum requested page size.
+    offset : int
+        Number of matching rows skipped.
+    """
+
+    jobs:   list[JobInfo]
+    total:  int
+    limit:  int
+    offset: int
+
+
 # --------------------------------------------------------------------------------------
 # Job operations
 
@@ -166,7 +197,9 @@ def get_job(job_id: str) -> JobInfo | None:
 def list_jobs(
     user:   str | None = None,
     status: str | None = None,
-) -> list[JobInfo]:
+    limit:  int = DEFAULT_JOB_LIST_LIMIT,
+    offset: int = 0,
+) -> JobListPage:
     """
     Return a list of jobs, optionally filtered by user and/or status.
 
@@ -177,17 +210,28 @@ def list_jobs(
     status : str | None
         When given, only jobs in this status are returned.
         Must be one of: queued, running, done, failed, cancelled.
+    limit : int
+        Maximum number of jobs to return.
+    offset : int
+        Number of matching jobs to skip.
 
     Returns
     -------
-    list[JobInfo]
-        Matching jobs ordered by submission time descending.
+    JobListPage
+        Matching page ordered by submission time descending plus total count.
 
     Raises
     ------
     ValueError
-        If *status* is not a valid ``JobStatus`` value.
+        If *status*, *limit*, or *offset* is invalid.
     """
+
+    if limit <= 0:
+        raise ValueError("limit must be greater than 0.")
+    if limit > MAX_JOB_LIST_LIMIT:
+        raise ValueError(f"limit must be <= {MAX_JOB_LIST_LIMIT}.")
+    if offset < 0:
+        raise ValueError("offset must be greater than or equal to 0.")
 
     if status is not None:
         try:
@@ -204,9 +248,15 @@ def list_jobs(
             query = query.filter(models.Job.user == user)
         if status is not None:
             query = query.filter(models.Job.status == status_filter)
-        query = query.order_by(models.Job.submitted_at.desc())
+        total = query.count()
+        query = query.order_by(models.Job.submitted_at.desc()).offset(offset).limit(limit)
         jobs = query.all()
-        return [_job_to_info(j) for j in jobs]
+        return JobListPage(
+            jobs=[_job_to_info(j) for j in jobs],
+            total=total,
+            limit=limit,
+            offset=offset,
+        )
 
 
 def cancel_job(job_id: str, user: str | None = None) -> JobInfo | None:
@@ -273,7 +323,11 @@ def cancel_job(job_id: str, user: str | None = None) -> JobInfo | None:
         return _job_to_info(job)
 
 
-def get_log(job_id: str, stream: str = "stdout") -> str:
+def get_log(
+    job_id:    str,
+    stream:    str = "stdout",
+    max_bytes: int = DEFAULT_LOG_MAX_BYTES,
+) -> str:
     """
     Return the log content for a job.
 
@@ -283,6 +337,8 @@ def get_log(job_id: str, stream: str = "stdout") -> str:
         UUID of the job.
     stream : str
         Which log stream to read: ``"stdout"`` or ``"stderr"``.
+    max_bytes : int
+        Maximum number of bytes to read from the end of the log file.
 
     Returns
     -------
@@ -297,6 +353,10 @@ def get_log(job_id: str, stream: str = "stdout") -> str:
 
     if stream not in ("stdout", "stderr"):
         raise ValueError(f"stream must be 'stdout' or 'stderr', got {stream!r}.")
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be greater than 0.")
+    if max_bytes > MAX_LOG_MAX_BYTES:
+        raise ValueError(f"max_bytes must be <= {MAX_LOG_MAX_BYTES}.")
 
     with database.get_session() as session:
         job = session.get(models.Job, job_id)
@@ -314,7 +374,7 @@ def get_log(job_id: str, stream: str = "stdout") -> str:
         if not path.exists():
             return f"Log file not found: {log_path}"
 
-        return path.read_text(encoding="utf-8", errors="replace")
+        return _read_log_tail(path, max_bytes=max_bytes)
 
 
 # --------------------------------------------------------------------------------------
@@ -386,6 +446,12 @@ def set_resources(
 
     if total_cpus is None and total_gpus is None and total_mem_mb is None:
         raise ValueError("At least one resource field must be specified.")
+    if total_cpus is not None and total_cpus <= 0:
+        raise ValueError("total_cpus must be greater than 0.")
+    if total_gpus is not None and total_gpus < 0:
+        raise ValueError("total_gpus must be greater than or equal to 0.")
+    if total_mem_mb is not None and total_mem_mb <= 0:
+        raise ValueError("total_mem_mb must be greater than 0.")
 
     with database.get_session() as session:
         row: models.Resource | None = session.get(models.Resource, 1)
@@ -449,6 +515,31 @@ def _job_to_info(job: models.Job) -> JobInfo:
         log_stdout=job.log_stdout,
         log_stderr=job.log_stderr,
     )
+
+
+def _read_log_tail(path: pathlib.Path, max_bytes: int) -> str:
+    """
+    Read at most *max_bytes* from the end of *path*.
+
+    This keeps log responses bounded even when stdout/stderr grows very large.
+    A short marker is prepended when older content was omitted.
+    """
+
+    size = path.stat().st_size
+    offset = max(0, size - max_bytes)
+
+    with path.open("rb") as f:
+        if offset:
+            f.seek(offset)
+        data = f.read(max_bytes)
+
+    text = data.decode("utf-8", errors="replace")
+    if offset:
+        return (
+            f"[log truncated: showing last {len(data)} of {size} bytes]\n"
+            f"{text}"
+        )
+    return text
 
 
 def _compute_usage(

@@ -22,6 +22,12 @@ _LOG_DIR_ENV:        str = "QJOB_LOG_DIR"
 _DEFAULT_LOG_DIR:    str = "/tmp/qjob_logs"
 _SIGTERM_GRACE_SEC:  float = 10.0   # Seconds between SIGTERM and SIGKILL.
 
+# --------------------------------------------------------------------------------------
+# Active subprocess registry
+
+_active_processes: dict[str, asyncio.subprocess.Process] = {}
+_active_tasks:     set[asyncio.Task] = set()
+
 
 # --------------------------------------------------------------------------------------
 # Public API
@@ -56,10 +62,60 @@ def start_job(job: models.Job, resource_pool: object) -> None:
     """
 
     loop = asyncio.get_event_loop()
-    loop.create_task(
+    task = loop.create_task(
         _run_job(job, resource_pool),
         name=f"job-{job.id}",
     )
+    _active_tasks.add(task)
+    task.add_done_callback(_active_tasks.discard)
+
+
+async def shutdown_active_jobs(grace_sec: float = _SIGTERM_GRACE_SEC) -> None:
+    """
+    Terminate all subprocesses currently managed by this runner.
+
+    Sends SIGTERM to each active job, waits up to *grace_sec*, then escalates
+    any remaining processes to SIGKILL. The per-job monitor tasks are then
+    awaited so they can persist final DB state and release resources.
+
+    Parameters
+    ----------
+    grace_sec : float
+        Seconds to wait after SIGTERM before sending SIGKILL.
+
+    Returns
+    -------
+    None
+    """
+
+    processes = [
+        process
+        for process in _active_processes.values()
+        if process.returncode is None
+    ]
+    if not processes:
+        return
+
+    logger.info("Terminating %d active job subprocess(es).", len(processes))
+
+    for process in processes:
+        _send_signal(process, signal.SIGTERM)
+
+    tasks = [task for task in _active_tasks if not task.done()]
+    waitables = tasks or [asyncio.create_task(process.wait()) for process in processes]
+
+    _, pending = await asyncio.wait(waitables, timeout=grace_sec)
+    if pending:
+        still_running = [
+            process
+            for process in processes
+            if process.returncode is None
+        ]
+        for process in still_running:
+            _send_signal(process, signal.SIGKILL)
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    await asyncio.gather(*waitables, return_exceptions=True)
 
 
 # --------------------------------------------------------------------------------------
@@ -89,6 +145,8 @@ async def _run_job(job: models.Job, resource_pool: object) -> None:
 
     env = _build_env(job)
 
+    process: asyncio.subprocess.Process | None = None
+
     try:
         process = await _spawn(job, env, stdout_path, stderr_path)
     except Exception:
@@ -96,11 +154,16 @@ async def _run_job(job: models.Job, resource_pool: object) -> None:
         _mark_failed(job, resource_pool)
         return
 
-    _mark_running(job, process.pid, stdout_path, stderr_path)
+    _active_processes[job.id] = process
 
-    exit_code = await _wait_with_walltime(job, process)
+    try:
+        _mark_running(job, process.pid, stdout_path, stderr_path)
 
-    _mark_finished(job, exit_code, resource_pool)
+        exit_code = await _wait_with_walltime(job, process)
+
+        _mark_finished(job, exit_code, resource_pool)
+    finally:
+        _active_processes.pop(job.id, None)
 
 
 # --------------------------------------------------------------------------------------
