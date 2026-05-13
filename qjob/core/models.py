@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime
 import enum
-import uuid
+import secrets
 
 import sqlalchemy
 import sqlalchemy.orm
@@ -42,13 +42,15 @@ class Job(Base):
     Attributes
     ----------
     id : str
-        UUID primary key assigned at submission time.
+        12-character lowercase hex ID assigned at submission time.
     user : str
         OS username of the submitting user.
     name : str | None
         Human-readable job name from the --name directive.
     script_path : str
         Absolute path to the submitted shell script.
+    workdir : str | None
+        Directory used as the subprocess working directory.
     status : JobStatus
         Current lifecycle state of the job.
     req_cpus : int
@@ -85,7 +87,7 @@ class Job(Base):
 
     # -- Identity -----------------------------------------------------------------------
     id: sqlalchemy.orm.Mapped[str] = sqlalchemy.orm.mapped_column(
-        sqlalchemy.String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+        sqlalchemy.String(12), primary_key=True, default=lambda: secrets.token_hex(6)
     )
     user: sqlalchemy.orm.Mapped[str] = sqlalchemy.orm.mapped_column(
         sqlalchemy.String(64), nullable=False
@@ -95,6 +97,9 @@ class Job(Base):
     )
     script_path: sqlalchemy.orm.Mapped[str] = sqlalchemy.orm.mapped_column(
         sqlalchemy.Text, nullable=False
+    )
+    workdir: sqlalchemy.orm.Mapped[str | None] = sqlalchemy.orm.mapped_column(
+        sqlalchemy.Text, nullable=True
     )
 
     # -- Status -------------------------------------------------------------------------
@@ -170,6 +175,7 @@ class Job(Base):
         cls,
         directives: parser.JobDirectives,
         user: str,
+        workdir: str | None = None,
     ) -> Job:
         """
         Construct a Job instance from parsed #QJOB directives.
@@ -180,6 +186,8 @@ class Job(Base):
             Parsed directives returned by ``parser.parse_script()``.
         user : str
             OS username of the submitting user.
+        workdir : str | None
+            Directory used as the subprocess working directory.
 
         Returns
         -------
@@ -188,10 +196,11 @@ class Job(Base):
         """
 
         return cls(
-            id=str(uuid.uuid4()),
+            id=secrets.token_hex(6),
             user=user,
             name=directives.name,
             script_path=directives.script_path or "",
+            workdir=workdir,
             status=JobStatus.QUEUED,
             req_cpus=directives.cpus,
             req_gpus=directives.gpus,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import typing
 
@@ -9,6 +10,12 @@ import qjob.api.server as server
 import qjob.cli.dashboard as dashboard
 import qjob.cli.service as service
 import qjob.core.database as database
+import qjob.core.scheduler as _scheduler
+
+# --------------------------------------------------------------------------------------
+# Constants
+
+_DEFAULT_STATUS_LIMIT = 10
 
 # --------------------------------------------------------------------------------------
 # Typer application
@@ -16,7 +23,6 @@ import qjob.core.database as database
 app = typer.Typer(
     name="qjob",
     help="Lightweight job scheduler for research servers.",
-    add_completion=False,
     no_args_is_help=True,
 )
 
@@ -25,6 +31,23 @@ admin_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(admin_app, name="admin")
+
+
+# --------------------------------------------------------------------------------------
+# Shell completion helpers
+
+
+def _complete_status(incomplete: str) -> list[str]:
+    values = ["queued", "running", "done", "failed", "cancelled"]
+    return [v for v in values if v.startswith(incomplete)]
+
+
+def _complete_job_id(incomplete: str) -> list[str]:
+    try:
+        jobs = service.list_jobs(user=None)
+        return [j.id for j in jobs if j.id.startswith(incomplete)]
+    except Exception:
+        return []
 
 
 # --------------------------------------------------------------------------------------
@@ -64,7 +87,8 @@ def submit(
 @app.command()
 def status(
     job_id: typing.Optional[str] = typer.Argument(
-        None, help="Job ID to inspect. Omit to list all jobs."
+        None, help="Job ID to inspect. Omit to list all jobs.",
+        autocompletion=_complete_job_id,
     ),
     user: typing.Optional[str] = typer.Option(
         None, "--user", "-u", help="Filter by username."
@@ -75,6 +99,10 @@ def status(
     status_filter: typing.Optional[str] = typer.Option(
         None, "--status", "-s",
         help="Filter by status: queued, running, done, failed, cancelled.",
+        autocompletion=_complete_status,
+    ),
+    all_jobs: bool = typer.Option(
+        False, "--all-jobs", help="Show all matching jobs instead of the latest 10."
     ),
 ) -> None:
     """
@@ -97,7 +125,17 @@ def status(
 
     resolved_user = None if all_users else (user or os.environ.get("USER"))
     try:
-        jobs = service.list_jobs(user=resolved_user, status=status_filter)
+        if all_jobs:
+            jobs = service.list_jobs(user=resolved_user, status=status_filter)
+            truncated = False
+        else:
+            jobs = service.list_jobs(
+                user=resolved_user,
+                status=status_filter,
+                limit=_DEFAULT_STATUS_LIMIT + 1,
+            )
+            truncated = len(jobs) > _DEFAULT_STATUS_LIMIT
+            jobs = jobs[:_DEFAULT_STATUS_LIMIT]
     except ValueError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1)
@@ -109,7 +147,7 @@ def status(
         typer.echo("No jobs found.")
         return
 
-    _print_job_table(jobs)
+    _print_job_table(jobs, truncated=truncated)
 
 
 # --------------------------------------------------------------------------------------
@@ -118,7 +156,7 @@ def status(
 
 @app.command()
 def cancel(
-    job_id: str = typer.Argument(..., help="ID of the job to cancel."),
+    job_id: str = typer.Argument(..., help="ID of the job to cancel.", autocompletion=_complete_job_id),
 ) -> None:
     """Cancel a queued or running job."""
 
@@ -147,7 +185,7 @@ def cancel(
 
 @app.command()
 def log(
-    job_id: str = typer.Argument(..., help="ID of the job whose log to display."),
+    job_id: str = typer.Argument(..., help="ID of the job whose log to display.", autocompletion=_complete_job_id),
     stderr: bool = typer.Option(
         False, "--stderr", "-e", help="Show stderr instead of stdout."
     ),
@@ -212,19 +250,67 @@ def serve(
     reload: bool = typer.Option(
         False, "--reload", help="Enable auto-reload (development only)."
     ),
+    workers: int = typer.Option(
+        1, "--workers", "-w", help="Number of uvicorn worker processes."
+    ),
 ) -> None:
     """
-    Start the qjob API server (FastAPI + uvicorn) with the scheduler.
+    Start the qjob API server (FastAPI + uvicorn).
 
-    The scheduler runs inside the server process.  Press Ctrl+C to stop.
+    For multi-process deployments use --workers N and run 'qjob scheduler'
+    as a separate process.  Press Ctrl+C to stop.
     """
+
+    if reload and workers > 1:
+        typer.echo("Error: --reload and --workers cannot be combined.", err=True)
+        raise typer.Exit(code=1)
 
     server.serve(
         host=host,
         port=port,
         log_level=log_level,
         reload=reload,
+        workers=workers,
     )
+
+
+# --------------------------------------------------------------------------------------
+# scheduler
+
+
+@app.command()
+def scheduler(
+    poll_interval: float = typer.Option(
+        2.0, "--poll-interval", help="Seconds between scheduling ticks."
+    ),
+    max_workers: int = typer.Option(
+        64, "--max-workers", help="Maximum number of concurrently running jobs."
+    ),
+) -> None:
+    """
+    Start the standalone job scheduler process.
+
+    Only one scheduler may run at a time; a second invocation will exit
+    immediately with an error.  Press Ctrl+C to stop gracefully.
+    """
+
+    try:
+        database.init_db()
+    except RuntimeError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    sched = _scheduler.Scheduler(
+        poll_interval=poll_interval,
+        max_workers=max_workers,
+        install_signal_handlers=True,
+    )
+
+    try:
+        asyncio.run(sched.start())
+    except RuntimeError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1)
 
 
 # --------------------------------------------------------------------------------------
@@ -289,7 +375,7 @@ def admin_set_resources(
 @admin_app.command("list-jobs")
 def admin_list_jobs(
     status_filter: typing.Optional[str] = typer.Option(
-        None, "--status", "-s", help="Filter by status."
+        None, "--status", "-s", help="Filter by status.", autocompletion=_complete_status,
     ),
 ) -> None:
     """List all jobs from all users (admin view)."""
@@ -314,7 +400,10 @@ def admin_list_jobs(
 # Display helpers
 
 
-def _print_job_table(jobs: list[service.JobInfo]) -> None:
+def _print_job_table(
+    jobs:      list[service.JobInfo],
+    truncated: bool = False,
+) -> None:
     """Print a compact table of jobs to stdout."""
 
     header = (
@@ -329,6 +418,8 @@ def _print_job_table(jobs: list[service.JobInfo]) -> None:
             f"{j.id:<36}  {j.user:<10}  {name:<20}  {j.status:<10}  "
             f"{j.req_cpus:>3}  {j.req_gpus:>3}  {j.priority:>3}"
         )
+    if truncated:
+        typer.echo("...")
 
 
 def _print_job_detail(info: service.JobInfo) -> None:
@@ -350,6 +441,7 @@ def _print_job_detail(info: service.JobInfo) -> None:
         f"Started      : {_fmt(info.started_at)}",
         f"Finished     : {_fmt(info.finished_at)}",
         f"Exit code    : {info.exit_code if info.exit_code is not None else '—'}",
+        f"Workdir      : {info.workdir or '—'}",
         f"Stdout log   : {info.log_stdout or '—'}",
         f"Stderr log   : {info.log_stderr or '—'}",
     ]

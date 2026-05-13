@@ -7,6 +7,7 @@ import logging
 import signal
 import threading
 
+import sqlalchemy
 import sqlalchemy.orm
 
 import qjob.core.database as database
@@ -25,6 +26,10 @@ _DEFAULT_POLL_INTERVAL:    float = 2.0   # Seconds between scheduler ticks.
 _DEFAULT_MAX_WORKERS:      int = 64     # Upper bound on concurrently running jobs.
 _DEFAULT_AGING_FACTOR:     float = 5.0    # Priority points added per hour of waiting.
 _BACKFILL_WALLTIME_MARGIN: float = 0.9    # Backfill job's walltime / reserve window.
+
+# PostgreSQL session-level advisory lock key (must be a unique bigint per application).
+# Derived from ascii("qjob") — prevents two scheduler processes from running at once.
+_ADVISORY_LOCK_KEY: int = 0x716A6F62
 
 
 # --------------------------------------------------------------------------------------
@@ -276,6 +281,7 @@ class Scheduler:
         self._aging_factor = aging_factor
         self._install_signal_handlers_enabled = install_signal_handlers
         self._running: bool = False
+        self._lock_conn: sqlalchemy.engine.Connection | None = None
 
     # -- Public API --------------------------------------------------------------------
 
@@ -296,6 +302,7 @@ class Scheduler:
         """
 
         self._ensure_resource_row()
+        self._acquire_lock()
         self._running = True
         if self._install_signal_handlers_enabled:
             self._install_signal_handlers()
@@ -309,19 +316,22 @@ class Scheduler:
         # Recover any jobs that were RUNNING when the process last stopped.
         self._recover_interrupted_jobs()
 
-        while self._running:
-            try:
-                await self._tick()
-            except Exception:
-                logger.exception("Unhandled error in scheduler tick.")
-            await asyncio.sleep(self._poll_interval)
-
-        await runner.shutdown_active_jobs()
         try:
-            with database.get_session_for_update() as session:
-                self._release_finished_jobs(session)
-        except Exception:
-            logger.exception("Failed to release resources during scheduler shutdown.")
+            while self._running:
+                try:
+                    await self._tick()
+                except Exception:
+                    logger.exception("Unhandled error in scheduler tick.")
+                await asyncio.sleep(self._poll_interval)
+
+            await runner.shutdown_active_jobs()
+            try:
+                with database.get_session_for_update() as session:
+                    self._release_finished_jobs(session)
+            except Exception:
+                logger.exception("Failed to release resources during scheduler shutdown.")
+        finally:
+            self._release_lock()
 
         logger.info("Scheduler stopped.")
 
@@ -354,9 +364,11 @@ class Scheduler:
         Steps
         -----
         1. Lock the resources row and release resources held by finished jobs.
-        2. Apply ageing to queued jobs.
-        3. Re-sort the queue by effective priority DESC, submitted_at ASC.
-        4. Try to run the head job; fall back to EASY Backfill when blocked.
+        2. Sort the queue by effective priority DESC, submitted_at ASC.
+           Effective priority is computed in-memory (base priority + ageing);
+           the DB value is never mutated.
+        3. Try to run the head job; fall back to EASY Backfill when blocked.
+        4. Stop at the first blocked head (single reservation guarantee).
         5. Repeat until the worker slot limit is reached.
 
         Parameters
@@ -380,8 +392,6 @@ class Scheduler:
             candidates = self._fetch_queued(session)
             if not candidates:
                 return
-
-            self._apply_aging(session, candidates)
 
             candidates.sort(
                 key=lambda j: (-self._effective_priority(j), j.submitted_at or 0)
@@ -417,36 +427,35 @@ class Scheduler:
                     dispatched += 1
                 else:
                     reservation_sec = self._estimate_reservation_window(session, head)
-                    if reservation_sec is None:
-                        continue
-
-                    backfill = self._find_backfill_jobs(
-                        candidates=candidates[head_idx + 1:],
-                        launched_ids=launched_ids,
-                        reservation_sec=reservation_sec,
-                        slots_remaining=slots - dispatched,
-                    )
-                    for bf_job in backfill:
-                        resource_row = session.get(models.Resource, 1)
-                        if resource_row is None:
-                            break
-                        if resource_row.can_fit(bf_job):
-                            cpu_ids, gpu_ids = self._allocate_db(
-                                session,
-                                resource_row,
-                                bf_job,
-                                reserved_cpu_ids=reserved_cpu_ids,
-                                reserved_gpu_ids=reserved_gpu_ids,
-                            )
-                            self._launch(session, bf_job, cpu_ids, gpu_ids)
-                            launched_ids.add(bf_job.id)
-                            reserved_cpu_ids.update(cpu_ids)
-                            reserved_gpu_ids.update(gpu_ids)
-                            dispatched += 1
-                            logger.info(
-                                "Backfilled job %s (walltime=%ss, window=%ss).",
-                                bf_job.id, bf_job.walltime_sec, reservation_sec,
-                            )
+                    if reservation_sec is not None:
+                        backfill = self._find_backfill_jobs(
+                            candidates=candidates[head_idx + 1:],
+                            launched_ids=launched_ids,
+                            reservation_sec=reservation_sec,
+                            slots_remaining=slots - dispatched,
+                        )
+                        for bf_job in backfill:
+                            resource_row = session.get(models.Resource, 1)
+                            if resource_row is None:
+                                break
+                            if resource_row.can_fit(bf_job):
+                                cpu_ids, gpu_ids = self._allocate_db(
+                                    session,
+                                    resource_row,
+                                    bf_job,
+                                    reserved_cpu_ids=reserved_cpu_ids,
+                                    reserved_gpu_ids=reserved_gpu_ids,
+                                )
+                                self._launch(session, bf_job, cpu_ids, gpu_ids)
+                                launched_ids.add(bf_job.id)
+                                reserved_cpu_ids.update(cpu_ids)
+                                reserved_gpu_ids.update(gpu_ids)
+                                dispatched += 1
+                                logger.info(
+                                    "Backfilled job %s (walltime=%ss, window=%ss).",
+                                    bf_job.id, bf_job.walltime_sec, reservation_sec,
+                                )
+                    break  # EASY Backfill: stop at the first blocked head
 
             if dispatched:
                 logger.debug("Tick dispatched %d job(s).", dispatched)
@@ -539,10 +548,12 @@ class Scheduler:
 
     def _effective_priority(self, job: models.Job) -> float:
         """
-        Return the current effective priority of *job* after ageing.
+        Return the effective priority of *job* after ageing.
 
-        The effective priority is stored back in ``job.priority`` by
-        ``_apply_aging()``, so this simply returns that value as a float.
+        Ageing is computed in-memory from the job's base priority (the value
+        stored in the DB) and its total waiting time.  The result is never
+        written back to the database so the base priority is preserved across
+        ticks and the effective value always reflects the true elapsed wait.
 
         Parameters
         ----------
@@ -552,53 +563,21 @@ class Scheduler:
         Returns
         -------
         float
-            Current effective priority score.
-        """
-
-        return float(job.priority)
-
-    def _apply_aging(
-        self,
-        session:    sqlalchemy.orm.Session,
-        candidates: list[models.Job],
-    ) -> None:
-        """
-        Increment each queued job's priority by the ageing factor times the
-        number of hours it has been waiting, then persist the new value.
-
-        Ageing is additive and unbounded — a job that waits long enough will
-        always eventually reach the top of the queue.  The increment is applied
-        once per tick, so the effective rate is
-        ``aging_factor * (poll_interval / 3600)`` priority points per tick.
-
-        Parameters
-        ----------
-        session : sqlalchemy.orm.Session
-            Open DB session used to flush the updated priorities.
-        candidates : list[models.Job]
-            The QUEUED jobs returned by ``_fetch_queued()``.
-
-        Returns
-        -------
-        None
+            Effective priority capped at 100.0.
         """
 
         import datetime
 
+        if job.submitted_at is None:
+            return float(job.priority)
+
         now = datetime.datetime.now(datetime.timezone.utc)
+        submitted = job.submitted_at
+        if submitted.tzinfo is None:
+            submitted = submitted.replace(tzinfo=datetime.timezone.utc)
 
-        for job in candidates:
-            if job.submitted_at is None:
-                continue
-
-            submitted = job.submitted_at
-            # Some DB drivers may return naive datetimes; attach UTC so subtraction works.
-            if submitted.tzinfo is None:
-                submitted = submitted.replace(tzinfo=datetime.timezone.utc)
-
-            wait_hours = (now - submitted).total_seconds() / 3600.0
-            increment = self._aging_factor * wait_hours
-            job.priority = min(100, int(job.priority + increment))
+        wait_hours = (now - submitted).total_seconds() / 3600.0
+        return min(100.0, job.priority + self._aging_factor * wait_hours)
 
     def _estimate_reservation_window(
         self,
@@ -919,6 +898,52 @@ class Scheduler:
                 job.status = models.JobStatus.FAILED
                 job.assigned_cpus = None
                 job.assigned_gpus = None
+
+    def _acquire_lock(self) -> None:
+        """
+        Acquire a PostgreSQL session-level advisory lock.
+
+        The lock is held for the lifetime of ``_lock_conn`` and is released
+        automatically when that connection closes — including on process crash.
+
+        Raises
+        ------
+        RuntimeError
+            If another scheduler process already holds the lock.
+        """
+
+        engine = database.get_engine()
+        conn = engine.connect()
+        try:
+            acquired: bool = conn.execute(
+                sqlalchemy.text(f"SELECT pg_try_advisory_lock({_ADVISORY_LOCK_KEY})")
+            ).scalar()
+        except Exception:
+            conn.close()
+            raise
+
+        if not acquired:
+            conn.close()
+            raise RuntimeError(
+                "Another scheduler process is already running "
+                "(pg_try_advisory_lock failed). "
+                "Only one scheduler instance may run at a time."
+            )
+
+        self._lock_conn = conn
+        logger.info("Acquired scheduler advisory lock.")
+
+    def _release_lock(self) -> None:
+        """Close the lock-holding connection, releasing the advisory lock."""
+
+        if self._lock_conn is not None:
+            try:
+                self._lock_conn.close()
+            except Exception:
+                logger.debug("Error closing advisory lock connection.", exc_info=True)
+            finally:
+                self._lock_conn = None
+            logger.info("Released scheduler advisory lock.")
 
     def _install_signal_handlers(self) -> None:
         """

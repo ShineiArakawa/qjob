@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import logging
 import typing
@@ -12,7 +11,6 @@ import qjob.api.routers.jobs as jobs_router
 import qjob.api.routers.resources as resources_router
 import qjob.api.schemas as schemas
 import qjob.core.database as database
-import qjob.core.scheduler as scheduler
 
 # --------------------------------------------------------------------------------------
 # Module logger
@@ -49,30 +47,11 @@ def create_app(db_url: str | None = None) -> fastapi.FastAPI:
         The configured application instance.
     """
 
-    _sched = scheduler.Scheduler()
-
     @contextlib.asynccontextmanager
     async def lifespan(app: fastapi.FastAPI) -> typing.AsyncGenerator[None, None]:
-        """Start the scheduler on startup and stop it on shutdown."""
-
         database.init_db(db_url)
         logger.info("Database initialised.")
-
-        task = asyncio.create_task(_sched.start(), name="scheduler")
-        logger.info("Scheduler started.")
-
-        try:
-            yield
-        finally:
-            _sched.stop()
-
-            try:
-                await asyncio.wait_for(task, timeout=15.0)
-            except asyncio.TimeoutError:
-                logger.warning("Scheduler did not stop within 15s; cancelling task.")
-                task.cancel()
-
-            logger.info("Scheduler stopped.")
+        yield
 
     app = fastapi.FastAPI(
         title="qjob API",
@@ -119,6 +98,7 @@ def serve(
     log_level: str = "info",
     db_url:    str | None = None,
     reload:    bool = False,
+    workers:   int = 1,
 ) -> None:
     """
     Start the uvicorn server with the qjob FastAPI application.
@@ -132,22 +112,47 @@ def serve(
     log_level : str
         Uvicorn log level string (debug/info/warning/error).
     db_url : str | None
-        Database URL passed through to ``create_app()``.
+        Database URL passed through to ``create_app()``.  Ignored when
+        ``workers > 1``; set ``QJOB_DB_URL`` in the environment instead.
     reload : bool
-        Enable auto-reload for development.  Incompatible with the
-        in-process scheduler; use only during development.
+        Enable auto-reload for development.  Cannot be combined with
+        ``workers > 1``.
+    workers : int
+        Number of uvicorn worker processes.  Values greater than 1 require
+        ``QJOB_DB_URL`` to be set in the environment.
 
     Returns
     -------
     None
+
+    Raises
+    ------
+    ValueError
+        If both *reload* and *workers* > 1 are requested.
     """
 
-    app = create_app(db_url=db_url)
+    if reload and workers > 1:
+        raise ValueError("--reload and --workers cannot be combined.")
 
-    uvicorn.run(
-        app,
-        host=host,
-        port=port,
-        log_level=log_level.lower(),
-        reload=reload,
-    )
+    if workers > 1:
+        # Multi-worker mode requires an import string, not an app object.
+        uvicorn.run(
+            "qjob.api.server:app",
+            host=host,
+            port=port,
+            log_level=log_level.lower(),
+            workers=workers,
+        )
+    else:
+        uvicorn.run(
+            create_app(db_url=db_url),
+            host=host,
+            port=port,
+            log_level=log_level.lower(),
+            reload=reload,
+        )
+
+
+# Module-level app instance used when ``workers > 1``.
+# The DB URL is read from QJOB_DB_URL at startup time via the lifespan.
+app = create_app()

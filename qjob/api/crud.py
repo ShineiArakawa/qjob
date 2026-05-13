@@ -64,6 +64,8 @@ class JobInfo:
         Path to the stdout log file.
     log_stderr : str | None
         Path to the stderr log file.
+    workdir : str | None
+        Directory used as the subprocess working directory.
     """
 
     id:           str
@@ -80,6 +82,7 @@ class JobInfo:
     exit_code:    int | None
     log_stdout:   str | None
     log_stderr:   str | None
+    workdir:      str | None
 
 
 @dataclasses.dataclass
@@ -138,7 +141,11 @@ class JobListPage:
 # Job operations
 
 
-def submit_job(script_path: str, user: str | None = None) -> JobInfo:
+def submit_job(
+    script_path: str,
+    user:        str | None = None,
+    workdir:     str | None = None,
+) -> JobInfo:
     """
     Parse a shell script and enqueue it as a new job.
 
@@ -148,6 +155,9 @@ def submit_job(script_path: str, user: str | None = None) -> JobInfo:
         Path to the shell script containing ``#QJOB`` directives.
     user : str | None
         Username of the submitting user.  Defaults to the OS login name.
+    workdir : str | None
+        Directory used as the subprocess working directory. Defaults to the
+        submitted script's parent directory.
 
     Returns
     -------
@@ -164,7 +174,12 @@ def submit_job(script_path: str, user: str | None = None) -> JobInfo:
 
     resolved_user = user or getpass.getuser()
     directives = parser.parse_script(pathlib.Path(script_path))
-    job = models.Job.from_directives(directives, user=resolved_user)
+    resolved_workdir = _resolve_workdir(workdir, directives.script_path)
+    job = models.Job.from_directives(
+        directives,
+        user=resolved_user,
+        workdir=resolved_workdir,
+    )
 
     with database.get_session() as session:
         session.add(job)
@@ -514,7 +529,28 @@ def _job_to_info(job: models.Job) -> JobInfo:
         exit_code=job.exit_code,
         log_stdout=job.log_stdout,
         log_stderr=job.log_stderr,
+        workdir=job.workdir,
     )
+
+
+def _resolve_workdir(workdir: str | None, script_path: str | None) -> str:
+    """
+    Return an absolute working directory for a submitted job.
+
+    When *workdir* is omitted, the script's parent directory is used.
+    """
+
+    if workdir is None:
+        if not script_path:
+            raise ValueError("script_path is required to infer workdir.")
+        return str(pathlib.Path(script_path).resolve().parent)
+
+    path = pathlib.Path(workdir).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Working directory not found: {workdir}")
+    if not path.is_dir():
+        raise NotADirectoryError(f"Working directory is not a directory: {workdir}")
+    return str(path)
 
 
 def _read_log_tail(path: pathlib.Path, max_bytes: int) -> str:

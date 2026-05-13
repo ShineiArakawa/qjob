@@ -18,10 +18,13 @@ class JobSubmitRequest(pydantic.BaseModel):
         Absolute path to the shell script on the server.
     user : str | None
         Submitting username.  When None the server resolves it from the OS.
+    workdir : str | None
+        Working directory to use when running the script.
     """
 
     script_path: str
     user:        str | None = None
+    workdir:     str | None = None
 
 
 class JobResponse(pydantic.BaseModel):
@@ -58,6 +61,8 @@ class JobResponse(pydantic.BaseModel):
         Path to the stdout log file.
     log_stderr : str | None
         Path to the stderr log file.
+    workdir : str | None
+        Directory used as the subprocess working directory.
     """
 
     id:           str
@@ -74,6 +79,7 @@ class JobResponse(pydantic.BaseModel):
     exit_code:    int | None
     log_stdout:   str | None
     log_stderr:   str | None
+    workdir:      str | None
 
     model_config = pydantic.ConfigDict(from_attributes=True)
 

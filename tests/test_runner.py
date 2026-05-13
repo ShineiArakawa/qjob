@@ -102,30 +102,23 @@ class TestBuildEnv:
 
 
 # --------------------------------------------------------------------------------------
-# _ensure_log_dir
+# _log_paths
 
 
-class TestEnsureLogDir:
-    """_ensure_log_dir() creates the correct directory structure."""
+class TestLogPaths:
+    """_log_paths() creates predictable per-job log filenames."""
 
-    def test_creates_dir(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("QJOB_LOG_DIR", str(tmp_path))
-        job = _make_job()
-        log_dir = runner._ensure_log_dir(job)
-        assert log_dir.exists()
-        assert log_dir.is_dir()
+    def test_stdout_log_is_next_to_script(self, tmp_path):
+        script = tmp_path / "job.sh"
+        job = _make_job(script_path=str(script))
+        stdout_path, _ = runner._log_paths(job)
+        assert stdout_path == tmp_path / f"job.sh.{job.id}.stdout.log"
 
-    def test_dir_named_by_job_id(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("QJOB_LOG_DIR", str(tmp_path))
-        job = _make_job()
-        log_dir = runner._ensure_log_dir(job)
-        assert log_dir.name == job.id
-
-    def test_idempotent_when_dir_exists(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("QJOB_LOG_DIR", str(tmp_path))
-        job = _make_job()
-        runner._ensure_log_dir(job)
-        runner._ensure_log_dir(job)  # Must not raise.
+    def test_stderr_log_is_next_to_script(self, tmp_path):
+        script = tmp_path / "job.sh"
+        job = _make_job(script_path=str(script))
+        _, stderr_path = runner._log_paths(job)
+        assert stderr_path == tmp_path / f"job.sh.{job.id}.stderr.log"
 
 
 # --------------------------------------------------------------------------------------
@@ -243,7 +236,6 @@ class TestRunJobEndToEnd:
 
     @_skip_subprocess
     def test_successful_job_becomes_done(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("QJOB_LOG_DIR", str(tmp_path))
         script = _make_script(tmp_path, """\
             #!/bin/bash
             echo "hello from job"
@@ -264,7 +256,6 @@ class TestRunJobEndToEnd:
 
     @_skip_subprocess
     def test_failing_job_becomes_failed(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("QJOB_LOG_DIR", str(tmp_path))
         script = _make_script(tmp_path, """\
             #!/bin/bash
             exit 1
@@ -281,7 +272,6 @@ class TestRunJobEndToEnd:
 
     @_skip_subprocess
     def test_stdout_is_captured(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("QJOB_LOG_DIR", str(tmp_path))
         script = _make_script(tmp_path, """\
             #!/bin/bash
             echo "captured output"
@@ -293,12 +283,12 @@ class TestRunJobEndToEnd:
 
         with database.get_session() as session:
             stored = session.get(models.Job, job.id)
+            assert stored.log_stdout == str(tmp_path / f"job.sh.{job.id}.stdout.log")
             log_content = pathlib.Path(stored.log_stdout).read_text()
             assert "captured output" in log_content
 
     @_skip_subprocess
     def test_stderr_is_captured(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("QJOB_LOG_DIR", str(tmp_path))
         script = _make_script(tmp_path, """\
             #!/bin/bash
             echo "error output" >&2
@@ -310,12 +300,12 @@ class TestRunJobEndToEnd:
 
         with database.get_session() as session:
             stored = session.get(models.Job, job.id)
+            assert stored.log_stderr == str(tmp_path / f"job.sh.{job.id}.stderr.log")
             log_content = pathlib.Path(stored.log_stderr).read_text()
             assert "error output" in log_content
 
     @_skip_subprocess
     def test_walltime_exceeded_becomes_failed(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("QJOB_LOG_DIR", str(tmp_path))
         monkeypatch.setattr(runner, "_SIGTERM_GRACE_SEC", 0.5)
         script = _make_script(tmp_path, """\
             #!/bin/bash
@@ -332,7 +322,6 @@ class TestRunJobEndToEnd:
 
     @_skip_subprocess
     def test_resources_released_after_completion(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("QJOB_LOG_DIR", str(tmp_path))
         script = _make_script(tmp_path, "#!/bin/bash\nexit 0\n")
         job = _make_job(req_cpus=2, script_path=str(script))
         job.assigned_cpus = json.dumps([0, 1])
@@ -348,8 +337,6 @@ class TestRunJobEndToEnd:
     @_skip_subprocess
     def test_env_vars_available_in_script(self, tmp_path, monkeypatch):
         """QJOB_JOB_ID must be accessible from within the script."""
-
-        monkeypatch.setenv("QJOB_LOG_DIR", str(tmp_path))
         script = _make_script(tmp_path, """\
             #!/bin/bash
             echo "JOB_ID=${QJOB_JOB_ID}"
@@ -365,8 +352,28 @@ class TestRunJobEndToEnd:
             assert f"JOB_ID={job.id}" in log_content
 
     @_skip_subprocess
+    def test_job_runs_in_configured_workdir(self, tmp_path, monkeypatch):
+        script_dir = tmp_path / "scripts"
+        workdir = tmp_path / "submit-dir"
+        script_dir.mkdir()
+        workdir.mkdir()
+        script = _make_script(script_dir, """\
+            #!/bin/bash
+            pwd
+        """)
+        job = _make_job(script_path=str(script))
+        job.workdir = str(workdir)
+        pool = _make_pool()
+
+        asyncio.run(runner._run_job(job, pool))
+
+        with database.get_session() as session:
+            stored = session.get(models.Job, job.id)
+            log_content = pathlib.Path(stored.log_stdout).read_text().strip()
+            assert log_content == str(workdir)
+
+    @_skip_subprocess
     def test_shutdown_active_jobs_terminates_running_process(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("QJOB_LOG_DIR", str(tmp_path))
         script = _make_script(tmp_path, """\
             #!/bin/bash
             sleep 60

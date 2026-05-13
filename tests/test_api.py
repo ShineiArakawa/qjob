@@ -163,6 +163,33 @@ class TestSubmitJob:
         assert data["req_gpus"] == 1
         assert data["user"] == "alice"
 
+    def test_workdir_is_stored(self, client, make_script, tmp_path):
+        script = make_script("#!/bin/bash\npython x.py\n")
+        workdir = tmp_path / "submit-dir"
+        workdir.mkdir()
+
+        response = client.post(
+            "/jobs",
+            json={
+                "script_path": str(script),
+                "user": "alice",
+                "workdir": str(workdir),
+            },
+        )
+
+        assert response.status_code == 201
+        assert response.json()["workdir"] == str(workdir)
+
+    def test_default_workdir_is_script_parent(self, client, make_script):
+        script = make_script("#!/bin/bash\npython x.py\n")
+
+        response = client.post(
+            "/jobs", json={"script_path": str(script), "user": "alice"}
+        )
+
+        assert response.status_code == 201
+        assert response.json()["workdir"] == str(script.parent)
+
     def test_missing_script_returns_404(self, client):
         response = client.post(
             "/jobs", json={"script_path": "/nonexistent/job.sh"}

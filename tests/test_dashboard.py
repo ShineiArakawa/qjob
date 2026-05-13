@@ -56,6 +56,7 @@ def _make_job_info(**kwargs) -> service.JobInfo:
         exit_code=None,
         log_stdout=None,
         log_stderr=None,
+        workdir=None,
     )
     defaults.update(kwargs)
     return service.JobInfo(**defaults)

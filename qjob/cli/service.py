@@ -85,6 +85,8 @@ class JobInfo:
         Path to the stdout log file.
     log_stderr : str | None
         Path to the stderr log file.
+    workdir : str | None
+        Directory used as the subprocess working directory.
     """
 
     id:           str
@@ -101,6 +103,7 @@ class JobInfo:
     exit_code:    int | None
     log_stdout:   str | None
     log_stderr:   str | None
+    workdir:      str | None
 
 
 @dataclasses.dataclass
@@ -191,6 +194,8 @@ def get_job(job_id: str) -> JobInfo | None:
 def list_jobs(
     user:   str | None = None,
     status: str | None = None,
+    limit:  int | None = None,
+    offset: int = 0,
 ) -> list[JobInfo]:
     """
     Return a list of jobs, optionally filtered by user and/or status.
@@ -201,6 +206,11 @@ def list_jobs(
         When given, only jobs submitted by this user are returned.
     status : str | None
         When given, only jobs in this status are returned.
+    limit : int | None
+        Maximum number of jobs to return.  When None, all matching jobs are
+        fetched page by page.
+    offset : int
+        Number of matching jobs to skip when *limit* is set.
 
     Returns
     -------
@@ -213,7 +223,7 @@ def list_jobs(
         If *status* is not a valid ``JobStatus`` value.
     """
 
-    return _run(_async_list_jobs(user, status))
+    return _run(_async_list_jobs(user, status, limit, offset))
 
 
 def cancel_job(job_id: str, user: str | None = None) -> JobInfo | None:
@@ -335,10 +345,15 @@ async def _async_submit_job(
     """Async implementation of submit_job."""
 
     resolved_user = user or getpass.getuser()
+    workdir = os.getcwd()
     async with _async_client() as client:
         response = await client.post(
             "/jobs",
-            json={"script_path": script_path, "user": resolved_user},
+            json={
+                "script_path": script_path,
+                "user": resolved_user,
+                "workdir": workdir,
+            },
         )
         _raise_for_status(response)
     return _parse_job(response.json())
@@ -358,21 +373,63 @@ async def _async_get_job(job_id: str) -> JobInfo | None:
 async def _async_list_jobs(
     user:   str | None,
     status: str | None,
+    limit:  int | None,
+    offset: int,
 ) -> list[JobInfo]:
     """Async implementation of list_jobs."""
 
-    params: dict[str, str] = {}
+    async with _async_client() as client:
+        if limit is not None:
+            payload = await _fetch_jobs_page(
+                client,
+                user=user,
+                status=status,
+                limit=limit,
+                offset=offset,
+            )
+            return [_parse_job(j) for j in payload["jobs"]]
+
+        page_size = 1000
+        next_offset = 0
+        jobs: list[JobInfo] = []
+        while True:
+            payload = await _fetch_jobs_page(
+                client,
+                user=user,
+                status=status,
+                limit=page_size,
+                offset=next_offset,
+            )
+            jobs.extend(_parse_job(j) for j in payload["jobs"])
+            next_offset += len(payload["jobs"])
+            if next_offset >= payload["total"] or not payload["jobs"]:
+                break
+        return jobs
+
+
+async def _fetch_jobs_page(
+    client: httpx.AsyncClient,
+    user:   str | None,
+    status: str | None,
+    limit:  int,
+    offset: int,
+) -> dict:
+    """Fetch one /jobs page and return the decoded JSON payload."""
+
+    params: dict[str, str] = {
+        "limit": str(limit),
+        "offset": str(offset),
+    }
     if user is not None:
         params["user"] = user
     if status is not None:
         params["status"] = status
 
-    async with _async_client() as client:
-        response = await client.get("/jobs", params=params)
+    response = await client.get("/jobs", params=params)
     if response.status_code == 400:
         raise ValueError(response.json().get("detail", "Invalid request."))
     _raise_for_status(response)
-    return [_parse_job(j) for j in response.json()["jobs"]]
+    return response.json()
 
 
 async def _async_cancel_job(
@@ -512,6 +569,7 @@ def _parse_job(data: dict) -> JobInfo:
         exit_code=data.get("exit_code"),
         log_stdout=data.get("log_stdout"),
         log_stderr=data.get("log_stderr"),
+        workdir=data.get("workdir"),
     )
 
 

@@ -71,8 +71,13 @@ def init_db(url: str | None = None) -> sqlalchemy.engine.Engine:
 
     The engine uses ``NullPool`` by default so multi-process API deployments
     do not multiply idle database connections. Set ``QJOB_DB_POOL_ENABLED=1``
-    to opt into a per-process QueuePool. Schema creation and upgrades are
-    handled by Alembic, not by this function.
+    to opt into a per-process QueuePool.
+
+    On first call, all tables are created from the current model definitions
+    if they do not already exist (``CREATE TABLE IF NOT EXISTS`` semantics).
+    This means Alembic migrations are not required for a fresh deployment.
+    For in-place schema upgrades on an existing database, run
+    ``alembic upgrade head`` manually.
 
     Parameters
     ----------
@@ -125,7 +130,7 @@ def init_db(url: str | None = None) -> sqlalchemy.engine.Engine:
         expire_on_commit=False,
     )
 
-    # Insert the default resource row if the migrated table is empty.
+    models.Base.metadata.create_all(_engine)
     _ensure_default_resource()
 
     return _engine

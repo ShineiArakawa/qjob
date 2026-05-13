@@ -45,9 +45,15 @@ def submit_job(body: schemas.JobSubmitRequest) -> schemas.JobResponse:
     """
 
     try:
-        info = crud.submit_job(script_path=body.script_path, user=body.user)
+        info = crud.submit_job(
+            script_path=body.script_path,
+            user=body.user,
+            workdir=body.workdir,
+        )
     except FileNotFoundError as exc:
         raise fastapi.HTTPException(status_code=404, detail=str(exc))
+    except NotADirectoryError as exc:
+        raise fastapi.HTTPException(status_code=422, detail=str(exc))
     except crud.parser.DirectiveParseError as exc:
         raise fastapi.HTTPException(status_code=422, detail=str(exc))
 
@@ -291,4 +297,5 @@ def _info_to_response(info: crud.JobInfo) -> schemas.JobResponse:
         exit_code=info.exit_code,
         log_stdout=info.log_stdout,
         log_stderr=info.log_stderr,
+        workdir=info.workdir,
     )

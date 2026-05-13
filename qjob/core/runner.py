@@ -18,9 +18,7 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------------------
 # Constants
 
-_LOG_DIR_ENV:        str = "QJOB_LOG_DIR"
-_DEFAULT_LOG_DIR:    str = "/tmp/qjob_logs"
-_SIGTERM_GRACE_SEC:  float = 10.0   # Seconds between SIGTERM and SIGKILL.
+_SIGTERM_GRACE_SEC: float = 10.0   # Seconds between SIGTERM and SIGKILL.
 
 # --------------------------------------------------------------------------------------
 # Active subprocess registry
@@ -139,9 +137,7 @@ async def _run_job(job: models.Job, resource_pool: object) -> None:
     None
     """
 
-    log_dir = _ensure_log_dir(job)
-    stdout_path = log_dir / "stdout.log"
-    stderr_path = log_dir / "stderr.log"
+    stdout_path, stderr_path = _log_paths(job)
 
     env = _build_env(job)
 
@@ -210,12 +206,15 @@ async def _spawn(
     else:
         argv = ["bash", job.script_path]
 
+    cwd = job.workdir or str(pathlib.Path(job.script_path).resolve().parent)
+
     with stdout_path.open("wb") as fout, stderr_path.open("wb") as ferr:
         process = await asyncio.create_subprocess_exec(
             *argv,
             stdout=fout,
             stderr=ferr,
             env=env,
+            cwd=cwd,
             start_new_session=True,
         )
 
@@ -473,29 +472,21 @@ def _mark_failed(job: models.Job, resource_pool: object) -> None:
 
 
 # --------------------------------------------------------------------------------------
-# Log directory helpers
+# Log path helpers
 
 
-def _ensure_log_dir(job: models.Job) -> pathlib.Path:
+def _log_paths(job: models.Job) -> tuple[pathlib.Path, pathlib.Path]:
     """
-    Create and return the per-job log directory.
+    Return stdout/stderr log paths next to the submitted script.
 
-    The path is ``<QJOB_LOG_DIR>/<job.id>/``.  The base directory is taken
-    from the ``QJOB_LOG_DIR`` environment variable, defaulting to
-    ``/tmp/qjob_logs``.
-
-    Parameters
-    ----------
-    job : models.Job
-        The job whose ID names the subdirectory.
-
-    Returns
-    -------
-    pathlib.Path
-        The created (or already existing) log directory.
+    The files are named ``{script_name}.{job_id}.stdout.log`` and
+    ``{script_name}.{job_id}.stderr.log``.
     """
 
-    base = pathlib.Path(os.environ.get(_LOG_DIR_ENV, _DEFAULT_LOG_DIR))
-    log_dir = base / job.id
-    log_dir.mkdir(parents=True, exist_ok=True)
-    return log_dir
+    script_path = pathlib.Path(job.script_path).resolve()
+    script_dir = script_path.parent
+    script_name = script_path.name
+    return (
+        script_dir / f"{script_name}.{job.id}.stdout.log",
+        script_dir / f"{script_name}.{job.id}.stderr.log",
+    )

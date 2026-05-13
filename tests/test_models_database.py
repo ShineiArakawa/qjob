@@ -79,6 +79,14 @@ class TestJobFromDirectives:
         job = models.Job.from_directives(default_directives, user="alice")
         assert job.priority == 80
 
+    def test_workdir(self, default_directives):
+        job = models.Job.from_directives(
+            default_directives,
+            user="alice",
+            workdir="/home/user",
+        )
+        assert job.workdir == "/home/user"
+
     def test_initial_status_is_queued(self, default_directives):
         job = models.Job.from_directives(default_directives, user="alice")
         assert job.status == models.JobStatus.QUEUED
@@ -108,12 +116,14 @@ class TestJobFromDirectives:
 
 
 class TestJobId:
-    """Each Job receives a unique UUID string as its primary key."""
+    """Each Job receives a unique 12-character lowercase hex string as its primary key."""
 
     def test_id_is_assigned(self, default_directives):
         job = models.Job.from_directives(default_directives, user="alice")
         assert job.id is not None
-        assert len(job.id) == 36  # Standard UUID4 string length.
+        assert len(job.id) == 12
+        assert job.id == job.id.lower()
+        assert all(c in "0123456789abcdef" for c in job.id)
 
     def test_ids_are_unique(self, default_directives):
         job_a = models.Job.from_directives(default_directives, user="alice")

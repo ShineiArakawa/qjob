@@ -117,65 +117,61 @@ def _make_scheduler(**kwargs) -> scheduler.Scheduler:
 
 
 # --------------------------------------------------------------------------------------
-# Priority ageing tests
+# _effective_priority tests
 
 
-class TestApplyAging:
-    """_apply_aging() increases job priority based on wait time."""
+class TestEffectivePriority:
+    """_effective_priority() computes aging in-memory without mutating the DB."""
 
-    def test_priority_increases_after_waiting(self):
+    def test_returns_base_priority_when_no_wait(self):
+        job = _make_queued_job(priority=50, wait_hours=0.0)
+        sched = _make_scheduler(aging_factor=5.0)
+        ep = sched._effective_priority(job)
+        assert abs(ep - 50.0) < 0.1
+
+    def test_priority_increases_with_wait_time(self):
         job = _make_queued_job(priority=50, wait_hours=1.0)
-        sched = _make_scheduler(poll_interval=2.0, aging_factor=5.0)
-
-        with database.get_session() as session:
-            sched._apply_aging(session, [job])
-
-        assert job.priority > 50
+        sched = _make_scheduler(aging_factor=5.0)
+        assert sched._effective_priority(job) > 50.0
 
     def test_priority_capped_at_100(self):
-        # Job has been waiting a very long time.
-        job = _make_queued_job(priority=99, wait_hours=1000.0)
-        sched = _make_scheduler(poll_interval=2.0, aging_factor=100.0)
+        job = _make_queued_job(priority=50, wait_hours=1000.0)
+        sched = _make_scheduler(aging_factor=100.0)
+        assert sched._effective_priority(job) == 100.0
 
-        with database.get_session() as session:
-            sched._apply_aging(session, [job])
+    def test_higher_aging_factor_gives_higher_priority(self):
+        job_a = _make_queued_job(priority=50, wait_hours=2.0)
+        job_b = _make_queued_job(priority=50, wait_hours=2.0)
+        sched_slow = _make_scheduler(aging_factor=1.0)
+        sched_fast = _make_scheduler(aging_factor=10.0)
+        assert sched_fast._effective_priority(job_b) > sched_slow._effective_priority(job_a)
 
-        assert job.priority == 100
-
-    def test_zero_wait_time_no_increase(self):
-        job = _make_queued_job(priority=50, wait_hours=0.0)
-        sched = _make_scheduler(poll_interval=2.0, aging_factor=5.0)
-        original = job.priority
-
-        with database.get_session() as session:
-            sched._apply_aging(session, [job])
-
-        # Increment = 5.0 * (2.0 / 3600) ≈ 0.0028 → int() → 0
-        assert job.priority == original
-
-    def test_higher_aging_factor_increases_faster(self):
-        job_slow = _make_queued_job(priority=50, wait_hours=10.0)
-        job_fast = _make_queued_job(priority=50, wait_hours=10.0)
-        sched_slow = _make_scheduler(poll_interval=3600.0, aging_factor=1.0)
-        sched_fast = _make_scheduler(poll_interval=3600.0, aging_factor=10.0)
-
-        with database.get_session() as session:
-            sched_slow._apply_aging(session, [job_slow])
-            sched_fast._apply_aging(session, [job_fast])
-
-        assert job_fast.priority > job_slow.priority
-
-    def test_aging_persisted_to_db(self):
-        job = _make_queued_job(priority=50, wait_hours=0.0)
-        sched = _make_scheduler(poll_interval=7200.0, aging_factor=5.0)
-
-        with database.get_session() as session:
-            sched._apply_aging(session, [job])
-
+    def test_db_priority_not_mutated(self):
+        """Base priority in the DB must remain unchanged after calling _effective_priority."""
+        job = _make_queued_job(priority=50, wait_hours=2.0)
+        sched = _make_scheduler(aging_factor=5.0)
+        sched._effective_priority(job)
         with database.get_session() as session:
             stored = session.get(models.Job, job.id)
-            # After 2h poll_interval with aging_factor=5: 5*(7200/3600)=10 points
-            assert stored.priority >= 50
+        assert stored.priority == 50
+
+    def test_linear_growth_not_quadratic(self):
+        """Effective priority must grow linearly with wait time (not O(N²))."""
+        job1 = _make_queued_job(priority=0, wait_hours=1.0)
+        job2 = _make_queued_job(priority=0, wait_hours=2.0)
+        sched = _make_scheduler(aging_factor=5.0)
+        ep1 = sched._effective_priority(job1)
+        ep2 = sched._effective_priority(job2)
+        # Linear: ep(2h) / ep(1h) should be very close to 2.
+        assert abs(ep2 / ep1 - 2.0) < 0.05
+
+    def test_multiple_calls_do_not_compound(self):
+        """Calling _effective_priority twice must not accumulate additional aging."""
+        job = _make_queued_job(priority=50, wait_hours=1.0)
+        sched = _make_scheduler(aging_factor=5.0)
+        ep1 = sched._effective_priority(job)
+        ep2 = sched._effective_priority(job)
+        assert abs(ep1 - ep2) < 0.01
 
 
 # --------------------------------------------------------------------------------------
@@ -455,20 +451,164 @@ class TestSchedulerAgingFactor:
 class TestAgingIntegration:
     """A long-waiting low-priority job eventually overtakes a high-priority newcomer."""
 
-    def test_aged_job_has_higher_effective_priority(self):
-        # Job A: low priority, submitted 24 hours ago.
+    def test_aged_job_sorts_above_newer_high_priority_job(self):
+        # Job A: low base priority, submitted 24 hours ago.
         job_a = _make_queued_job(priority=20, wait_hours=24.0)
         # Job B: high priority, just submitted.
         job_b = _make_queued_job(priority=80, wait_hours=0.0)
 
-        # Use a 1-hour poll interval and high aging factor so one tick is enough.
-        sched = _make_scheduler(poll_interval=3600.0, aging_factor=5.0)
+        sched = _make_scheduler(aging_factor=5.0)
+
+        # job_a effective: min(100, 20 + 5*24) = 100.0
+        # job_b effective: min(100, 80 + ~0) = 80.0
+        # → job_a sorts first despite lower base priority.
+        candidates = [job_a, job_b]
+        candidates.sort(
+            key=lambda j: (-sched._effective_priority(j), j.submitted_at or 0)
+        )
+        assert candidates[0].id == job_a.id
+
+    def test_base_priority_unchanged_after_sort(self):
+        """Sorting by effective priority must not alter the stored base priority."""
+        job_a = _make_queued_job(priority=20, wait_hours=24.0)
+        job_b = _make_queued_job(priority=80, wait_hours=0.0)
+
+        sched = _make_scheduler(aging_factor=5.0)
+        sched._effective_priority(job_a)
+        sched._effective_priority(job_b)
 
         with database.get_session() as session:
-            sched._apply_aging(session, [job_a, job_b])
+            stored_a = session.get(models.Job, job_a.id)
+            stored_b = session.get(models.Job, job_b.id)
+        assert stored_a.priority == 20
+        assert stored_b.priority == 80
 
-        # After ageing: job_a gets +5 points; job_b stays at 80.
-        # With 24h wait and 1h poll: increment = 5*(3600/3600)=5 → job_a=25.
-        # To overtake job_b (80) job_a needs many ticks — just verify direction.
-        assert job_a.priority > 20
-        assert job_b.priority >= 80
+
+# --------------------------------------------------------------------------------------
+# EASY Backfill — single reservation guarantee
+
+
+class TestEasyBackfillSingleReservation:
+    """_tick() must honour EASY Backfill's single-reservation guarantee.
+
+    Classical EASY Backfill sets exactly one reservation for the head job
+    (the highest-priority blocked job) and allows backfill only within that
+    window.  After handling the first blocked head the loop must stop so that
+    jobs ineligible under the head's window are never launched.
+    """
+
+    def test_breaks_at_first_blocked_head_when_reservation_unknown(self, monkeypatch):
+        """
+        When the first blocked head has no estimable reservation (running job
+        has no walltime), the scheduler must break immediately rather than
+        falling through to try backfill for a subsequent blocked head.
+
+        Layout
+        ------
+        Resources : 6 CPUs total, 2 free (R1 uses 3, R2 uses 1).
+        R1        : 3 CPUs, walltime=None  → makes head[0]'s window = None.
+        R2        : 1 CPU,  walltime=60s   → after R2, free=3 ≥ head[1]'s need.
+        head[0]   : needs 4 CPUs (blocked). Reservation = None → break (fixed).
+        head[1]   : needs 3 CPUs (blocked). Reservation ≈ 60s.
+        bf        : needs 2 CPUs, walltime=50s (fits head[1]'s window).
+
+        Before the fix: continue past head[0] → backfill bf for head[1].
+        After  the fix: break at head[0]      → bf NOT launched.
+        """
+        launched: list[str] = []
+
+        def _fake_start(job, pool):
+            launched.append(job.id)
+
+        monkeypatch.setattr(scheduler.runner, "start_job", _fake_start)
+
+        with database.get_session() as session:
+            row = session.get(models.Resource, 1)
+            row.total_cpus = 6
+            row.used_cpus = 4        # 2 CPUs free
+            row.total_gpus = 0
+            row.total_mem_mb = 65536
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        r1 = models.Job(
+            user="alice", script_path="/tmp/r.sh",
+            status=models.JobStatus.RUNNING,
+            req_cpus=3, req_gpus=0, req_mem_mb=512,
+            walltime_sec=None,       # No walltime → head[0] reservation = None.
+            started_at=now,
+            assigned_cpus=json.dumps([0, 1, 2]),
+            assigned_gpus=json.dumps([]),
+        )
+        r2 = models.Job(
+            user="alice", script_path="/tmp/r.sh",
+            status=models.JobStatus.RUNNING,
+            req_cpus=1, req_gpus=0, req_mem_mb=512,
+            walltime_sec=60,
+            started_at=now,
+            assigned_cpus=json.dumps([3]),
+            assigned_gpus=json.dumps([]),
+        )
+        with database.get_session() as session:
+            session.add(r1)
+            session.add(r2)
+
+        # head[0]: 4 CPUs needed, 2 free → blocked.  Window = None.
+        head0 = _make_queued_job(priority=90, req_cpus=4)
+        # head[1]: 3 CPUs needed, 2 free → blocked.  Window ≈ 60s (via R2).
+        head1 = _make_queued_job(priority=70, req_cpus=3)
+        # bf: 2 CPUs, walltime=50s < 60*0.9=54s → eligible for head[1]'s window.
+        bf = _make_queued_job(priority=60, req_cpus=2, walltime_sec=50)
+
+        sched = _make_scheduler(max_workers=10)
+        asyncio.run(sched._tick())
+
+        # The loop must have broken at head[0]; bf must NOT be launched.
+        assert bf.id not in launched
+
+    def test_backfill_is_launched_when_head_has_estimable_window(self, monkeypatch):
+        """
+        When the first blocked head DOES have an estimable reservation, a
+        backfill job that fits within the window IS launched.
+
+        Layout
+        ------
+        Resources : 4 CPUs total, 2 free (R uses 2).
+        R         : 2 CPUs, walltime=120s → after R, 4 CPUs free.
+        head[0]   : needs 4 CPUs (blocked). Window ≈ 120*0.9 = 108s.
+        bf        : needs 2 CPUs (fits NOW), walltime=100s < 108s → eligible.
+        """
+        launched: list[str] = []
+
+        def _fake_start(job, pool):
+            launched.append(job.id)
+
+        monkeypatch.setattr(scheduler.runner, "start_job", _fake_start)
+
+        with database.get_session() as session:
+            row = session.get(models.Resource, 1)
+            row.total_cpus = 4
+            row.used_cpus = 2        # 2 CPUs free
+            row.total_gpus = 0
+            row.total_mem_mb = 65536
+
+        r = models.Job(
+            user="alice", script_path="/tmp/r.sh",
+            status=models.JobStatus.RUNNING,
+            req_cpus=2, req_gpus=0, req_mem_mb=512,
+            walltime_sec=120,
+            started_at=datetime.datetime.now(datetime.timezone.utc),
+            assigned_cpus=json.dumps([0, 1]),
+            assigned_gpus=json.dumps([]),
+        )
+        with database.get_session() as session:
+            session.add(r)
+
+        # head[0]: 4 CPUs needed, 2 free → blocked.  Window ≈ 108s.
+        head0 = _make_queued_job(priority=90, req_cpus=4)
+        # bf: 2 CPUs, walltime=100s < 108s → eligible backfill.
+        bf = _make_queued_job(priority=50, req_cpus=2, walltime_sec=100)
+
+        sched = _make_scheduler(max_workers=10)
+        asyncio.run(sched._tick())
+
+        assert bf.id in launched
