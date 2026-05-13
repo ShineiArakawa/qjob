@@ -9,7 +9,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me}
       POSTGRES_DB: ${POSTGRES_DB:-qjob}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - qjob-postgres-data:/var/lib/postgresql/data
     healthcheck:
       test:
         - CMD-SHELL
@@ -62,4 +62,4 @@ services:
         condition: service_healthy
 
 volumes:
-  postgres_data:
+  qjob-postgres-data:
