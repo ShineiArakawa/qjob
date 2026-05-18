@@ -1,53 +1,28 @@
 # qjob
 
-A lightweight job scheduler for research servers. Write `#QJOB` directives in shell scripts, submit them to a queue, and let qjob dispatch them automatically while managing CPU, GPU, and memory resources.
+A lightweight job scheduler designed for **lab-scale GPU servers**. Add `#QJOB` directives to any shell script, submit it to the queue, and qjob automatically dispatches jobs while managing CPU, GPU, and memory resources across users.
 
 ## Features
 
-- Submit jobs by adding `#QJOB` comments to any shell script
-- Resource management for CPU cores, GPUs, and memory
-- EASY Backfill scheduling with Priority Aging
-- REST API built on FastAPI + uvicorn
-- PostgreSQL backend with multi-process support
+- Submit jobs by adding `#QJOB` comments to any shell script — no special job script format required
+- Per-job resource requests for CPU cores, GPUs, and memory
+- EASY Backfill scheduling with Priority Aging for flexible priority control
+- REST API server built on FastAPI + uvicorn
+- PostgreSQL backend for persistent job management
 - Live TUI dashboard (`qjob dash`)
-- API server (`qjob serve`) and scheduler (`qjob scheduler`) run as independent processes
-
----
-
-## Architecture
-
-```text
-┌─────────────────────┐     HTTP      ┌───────────────────┐
-│   qjob CLI / User   │ ────────────► │  qjob serve       │
-│   (submit / status) │               │  (FastAPI/uvicorn) │
-└─────────────────────┘               └────────┬──────────┘
-                                               │ SQLAlchemy
-                                               ▼
-                                      ┌────────────────────┐
-                                      │     PostgreSQL      │
-                                      └────────┬───────────┘
-                                               │ SQLAlchemy
-                                      ┌────────▼───────────┐
-                                      │  qjob scheduler    │
-                                      │  (EASY Backfill)   │
-                                      └────────────────────┘
-```
-
-The API server and scheduler are separate processes. `qjob serve` can run with multiple workers. The scheduler uses a PostgreSQL Advisory Lock to ensure only one scheduler instance runs at a time.
 
 ---
 
 ## Requirements
 
+- **Ubuntu 22.04 or later**
 - Python 3.12 or later
 - PostgreSQL 14 or later
-- [uv](https://docs.astral.sh/uv/) (recommended) or pip
+- [uv](https://docs.astral.sh/uv/)
 
 ---
 
 ## Installation
-
-### Using uv (recommended)
 
 ```bash
 git clone <repository-url>
@@ -55,29 +30,38 @@ cd qjob
 uv sync
 ```
 
-### Using pip
-
-```bash
-git clone <repository-url>
-cd qjob
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
-```
-
 ---
 
 ## PostgreSQL Setup
 
-### Create the database and user
+### 1. Install PostgreSQL
 
-```sql
--- Run in psql
-CREATE USER qjob WITH PASSWORD 'your_password';
-CREATE DATABASE qjob OWNER qjob;
+```bash
+sudo apt update
+sudo apt install -y postgresql postgresql-contrib
+sudo systemctl enable postgresql
+sudo systemctl start postgresql
 ```
 
-### Create tables
+### 2. Open a psql session
+
+Connect to PostgreSQL as the `postgres` superuser:
+
+```bash
+sudo -u postgres psql
+```
+
+### 3. Create the database and user
+
+Run the following inside `psql`:
+
+```sql
+CREATE USER qjob WITH PASSWORD 'your_password';
+CREATE DATABASE qjob OWNER qjob;
+\q
+```
+
+### 4. Create tables
 
 Tables are created automatically on the first run of `qjob serve` or `qjob scheduler` using `CREATE TABLE IF NOT EXISTS`. No manual migration is needed for a fresh deployment.
 
@@ -112,6 +96,8 @@ Listens on `127.0.0.1:8000` by default.
 qjob scheduler
 ```
 
+The API server and scheduler run as independent processes. The scheduler uses a PostgreSQL Advisory Lock to ensure only one instance runs at a time.
+
 ### 4. Configure available resources
 
 ```bash
@@ -141,6 +127,44 @@ qjob status
 | `QJOB_DB_POOL_ENABLED` | Enable connection pooling (`1` / `true`) | `false` (NullPool) |
 | `QJOB_DB_POOL_SIZE` | Pool size (when `QJOB_DB_POOL_ENABLED=1`) | `5` |
 | `QJOB_DB_MAX_OVERFLOW` | Pool overflow limit | `5` |
+
+---
+
+## Writing Job Scripts
+
+Place `#QJOB` directives in the leading comment block of your shell script.
+
+```bash
+#!/usr/bin/env bash
+#QJOB --name my-training-job
+#QJOB --cpus 4 --gpus 1
+#QJOB --mem 8G --walltime 01:00:00 --priority high
+
+set -euo pipefail
+
+python train.py
+```
+
+### Directive Reference
+
+| Directive | Description | Default |
+| --------- | ----------- | ------- |
+| `--name <NAME>` | Human-readable job name | — |
+| `--cpus <N>` | Number of CPU cores | `1` |
+| `--gpus <N>` | Number of GPUs | `0` |
+| `--mem <SIZE>` | Memory (e.g. `4G`, `2048M`) | `1G` |
+| `--walltime <HH:MM:SS>` | Maximum wall-clock time | unlimited |
+| `--priority <LEVEL\|N>` | Priority: `low`=20, `normal`=50, `high`=80, or an integer 0–100 | `normal` (50) |
+| `--env <KEY>` | Environment variable name to forward to the job | — |
+
+### Environment Variables Injected into Jobs
+
+| Variable | Value |
+| -------- | ----- |
+| `QJOB_JOB_ID` | Job ID (12-character lowercase hex string) |
+| `QJOB_JOB_NAME` | Job name |
+| `QJOB_USER` | Submitting user's username |
+| `CUDA_VISIBLE_DEVICES` | Comma-separated list of assigned GPU indices |
 
 ---
 
@@ -206,15 +230,13 @@ qjob serve --log-level debug              # Verbose logging
 
 ### `qjob scheduler`
 
-Start the scheduler process.
+Start the scheduler process. Only one instance may run at a time; a second invocation exits immediately with an error.
 
 ```bash
 qjob scheduler
 qjob scheduler --poll-interval 5.0        # Poll every 5 seconds
 qjob scheduler --max-workers 128          # Max concurrent jobs
 ```
-
-Only one scheduler may run at a time. A second invocation exits immediately with an error.
 
 ### `qjob dash`
 
@@ -227,13 +249,11 @@ qjob dash --refresh 5.0    # Refresh interval in seconds
 
 ### `qjob admin set-resources`
 
-Update resource limits.
+Update resource limits. `--mem` is in megabytes.
 
 ```bash
 qjob admin set-resources --cpus 32 --gpus 4 --mem 65536
 ```
-
-`--mem` is in megabytes.
 
 ### `qjob admin list-jobs`
 
@@ -246,63 +266,9 @@ qjob admin list-jobs --status queued
 
 ---
 
-## Writing Job Scripts
-
-Place `#QJOB` directives in the leading comment block of your shell script.
-
-```bash
-#!/usr/bin/env bash
-#QJOB --name my-training-job
-#QJOB --cpus 4 --gpus 1
-#QJOB --mem 8G --walltime 01:00:00 --priority high
-
-set -euo pipefail
-
-python train.py
-```
-
-### Directive Reference
-
-| Directive | Description | Default |
-| --------- | ----------- | ------- |
-| `--name <NAME>` | Human-readable job name | — |
-| `--cpus <N>` | Number of CPU cores | `1` |
-| `--gpus <N>` | Number of GPUs | `0` |
-| `--mem <SIZE>` | Memory (e.g. `4G`, `2048M`) | `1G` |
-| `--walltime <HH:MM:SS>` | Maximum wall-clock time | unlimited |
-| `--priority <LEVEL\|N>` | Priority: `low`=20, `normal`=50, `high`=80, or an integer 0–100 | `normal` (50) |
-| `--env <KEY>` | Environment variable name to forward to the job | — |
-
-### Environment Variables Injected into Jobs
-
-| Variable | Value |
-| -------- | ----- |
-| `QJOB_JOB_ID` | Job ID (12-character lowercase hex string) |
-| `QJOB_JOB_NAME` | Job name |
-| `QJOB_USER` | Submitting user's username |
-| `CUDA_VISIBLE_DEVICES` | Comma-separated list of assigned GPU indices |
-
----
-
-## Multi-Process Deployment
-
-To scale with multiple uvicorn workers, use `--workers` and run the scheduler as a separate process.
-
-```bash
-# Terminal 1: API server with 4 workers
-QJOB_DB_URL="..." qjob serve --workers 4
-
-# Terminal 2: Scheduler
-QJOB_DB_URL="..." qjob scheduler
-```
-
-> When using `--workers 2` or more, `QJOB_DB_URL` must be set as an environment variable.
-
----
-
 ## Shell Completion
 
-Bash, Zsh, and Fish are supported.
+Bash, Zsh, and Fish are supported. Once enabled, job IDs and status values can be tab-completed.
 
 ```bash
 # Bash
@@ -314,56 +280,9 @@ qjob --install-completion zsh
 source ~/.zshrc
 ```
 
-Once enabled, job IDs and status values can be tab-completed.
-
 ---
 
 ## Scheduling Algorithm
 
 - **EASY Backfill**: When the head job (highest-priority blocked job) cannot run, qjob sets a reservation for it and allows smaller jobs to run ahead, provided they finish before the reservation window closes.
 - **Priority Aging**: The effective priority of a waiting job increases linearly over time at a rate of `aging_factor` priority points per hour. Aging is computed in-memory at sort time; the base priority stored in the database is never modified.
-
----
-
-## Development and Testing
-
-### Create a test database
-
-```sql
-CREATE USER qjob WITH PASSWORD 'your_test_password';
-CREATE DATABASE qjob_test OWNER qjob;
-```
-
-### Run the test suite
-
-```bash
-QJOB_TEST_DB_URL="postgresql+psycopg://qjob:your_test_password@localhost:5432/qjob_test" \
-  python -m pytest tests/ -v
-```
-
-Tests create the schema automatically and delete all data after each test. Tables are never dropped.
-
-### Development server with hot reload
-
-```bash
-QJOB_DB_URL="..." qjob serve --reload
-```
-
-> `--reload` and `--workers` cannot be used together.
-
----
-
-## Project Layout
-
-```text
-qjob/
-├── qjob/
-│   ├── api/           # FastAPI routers, schemas, CRUD
-│   ├── cli/           # Typer CLI, dashboard, service layer
-│   ├── core/          # Database, models, scheduler, runner, parser
-│   └── migrations/    # Alembic configuration (versions/ excluded from distribution)
-├── examples/          # Sample job scripts
-├── tests/             # pytest test suite
-├── alembic.ini        # Alembic configuration
-└── pyproject.toml
-```
