@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
 import os
 import typing
 
@@ -31,6 +32,25 @@ admin_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(admin_app, name="admin")
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        version = importlib.metadata.version("qjob")
+        typer.echo(f"qjob {version}")
+        raise typer.Exit()
+
+
+@app.callback()
+def _main(
+    version: typing.Optional[bool] = typer.Option(
+        None, "--version", "-V",
+        callback=_version_callback,
+        is_eager=True,
+        help="Show version and exit.",
+    ),
+) -> None:
+    pass
 
 
 # --------------------------------------------------------------------------------------
