@@ -176,11 +176,39 @@ def status(
 
 @app.command()
 def cancel(
-    job_ids: typing.List[str] = typer.Argument(
-        ..., help="IDs of the jobs to cancel.", autocompletion=_complete_job_id
+    job_ids: typing.Optional[typing.List[str]] = typer.Argument(
+        None, help="IDs of the jobs to cancel.", autocompletion=_complete_job_id
+    ),
+    all_jobs: bool = typer.Option(
+        False, "--all", "-a", help="Cancel all your queued and running jobs."
     ),
 ) -> None:
     """Cancel one or more queued or running jobs."""
+
+    if all_jobs and job_ids:
+        typer.echo("Error: --all cannot be combined with explicit job IDs.", err=True)
+        raise typer.Exit(code=1)
+
+    if not all_jobs and not job_ids:
+        typer.echo("Error: specify at least one JOB_ID or use --all.", err=True)
+        raise typer.Exit(code=1)
+
+    if all_jobs:
+        current_user = os.environ.get("USER")
+        try:
+            cancellable = [
+                j for j in service.list_jobs(user=current_user)
+                if j.status in ("queued", "running")
+            ]
+        except ConnectionError as exc:
+            typer.echo(f"Error: {exc}", err=True)
+            raise typer.Exit(code=1)
+
+        if not cancellable:
+            typer.echo("No cancellable jobs found.")
+            return
+
+        job_ids = [j.id for j in cancellable]
 
     # Validate all job IDs before cancelling any.
     not_found: list[str] = []
