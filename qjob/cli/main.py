@@ -156,27 +156,53 @@ def status(
 
 @app.command()
 def cancel(
-    job_id: str = typer.Argument(..., help="ID of the job to cancel.", autocompletion=_complete_job_id),
+    job_ids: typing.List[str] = typer.Argument(
+        ..., help="IDs of the jobs to cancel.", autocompletion=_complete_job_id
+    ),
 ) -> None:
-    """Cancel a queued or running job."""
+    """Cancel one or more queued or running jobs."""
 
-    try:
-        info = service.cancel_job(job_id)
-    except PermissionError as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(code=1)
-    except ValueError as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(code=1)
-    except ConnectionError as exc:
-        typer.echo(f"Error: {exc}", err=True)
+    # Validate all job IDs before cancelling any.
+    not_found: list[str] = []
+    for job_id in job_ids:
+        try:
+            info = service.get_job(job_id)
+        except ConnectionError as exc:
+            typer.echo(f"Error: {exc}", err=True)
+            raise typer.Exit(code=1)
+        if info is None:
+            not_found.append(job_id)
+
+    if not_found:
+        for job_id in not_found:
+            typer.echo(f"Error: Job {job_id!r} not found.", err=True)
         raise typer.Exit(code=1)
 
-    if info is None:
-        typer.echo(f"Error: Job {job_id!r} not found.", err=True)
-        raise typer.Exit(code=1)
+    exit_code = 0
+    for job_id in job_ids:
+        try:
+            info = service.cancel_job(job_id)
+        except PermissionError as exc:
+            typer.echo(f"Error: {exc}", err=True)
+            exit_code = 1
+            continue
+        except ValueError as exc:
+            typer.echo(f"Error: {exc}", err=True)
+            exit_code = 1
+            continue
+        except ConnectionError as exc:
+            typer.echo(f"Error: {exc}", err=True)
+            exit_code = 1
+            continue
 
-    typer.echo(f"Cancelled job {info.id}")
+        if info is None:
+            typer.echo(f"Error: Job {job_id!r} not found.", err=True)
+            exit_code = 1
+        else:
+            typer.echo(f"Cancelled job {info.id}")
+
+    if exit_code != 0:
+        raise typer.Exit(code=exit_code)
 
 
 # --------------------------------------------------------------------------------------
