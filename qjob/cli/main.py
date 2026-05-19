@@ -19,6 +19,10 @@ import qjob.core.scheduler as _scheduler
 
 _DEFAULT_STATUS_LIMIT = 10
 
+_SYSTEMD_DIR = pathlib.Path("/etc/systemd/system")
+_SERVER_UNIT = "qjob-server.service"
+_SCHEDULER_UNIT = "qjob-scheduler.service"
+
 # --------------------------------------------------------------------------------------
 # Typer application
 
@@ -321,7 +325,56 @@ def dash(
 
 
 # --------------------------------------------------------------------------------------
-# auth sub-commands
+# up / down
+
+
+@app.command()
+def up() -> None:
+    """Start qjob services (API server + scheduler) via systemd."""
+
+    import subprocess
+
+    if os.getuid() != 0:
+        typer.echo("Error: 'qjob up' must be run as root.", err=True)
+        raise typer.Exit(code=1)
+
+    for unit in (_SERVER_UNIT, _SCHEDULER_UNIT):
+        if not (_SYSTEMD_DIR / unit).exists():
+            typer.echo(
+                f"Error: {unit} not found. Run 'qjob admin install' first.", err=True
+            )
+            raise typer.Exit(code=1)
+
+    try:
+        subprocess.run(
+            ["systemctl", "start", _SERVER_UNIT, _SCHEDULER_UNIT], check=True
+        )
+    except subprocess.CalledProcessError as exc:
+        typer.echo(f"Error: systemctl exited with code {exc.returncode}.", err=True)
+        raise typer.Exit(code=1)
+
+    typer.echo("qjob services started.")
+
+
+@app.command()
+def down() -> None:
+    """Stop qjob services (scheduler + API server) via systemd."""
+
+    import subprocess
+
+    if os.getuid() != 0:
+        typer.echo("Error: 'qjob down' must be run as root.", err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        subprocess.run(
+            ["systemctl", "stop", _SCHEDULER_UNIT, _SERVER_UNIT], check=True
+        )
+    except subprocess.CalledProcessError as exc:
+        typer.echo(f"Error: systemctl exited with code {exc.returncode}.", err=True)
+        raise typer.Exit(code=1)
+
+    typer.echo("qjob services stopped.")
 
 
 # --------------------------------------------------------------------------------------
@@ -594,6 +647,185 @@ def admin_scheduler(
     except RuntimeError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1)
+
+
+@admin_app.command("install")
+def admin_install(
+    host: str = typer.Option(
+        "127.0.0.1", "--host", "-H", help="Host for the API server."
+    ),
+    port: int = typer.Option(
+        8000, "--port", "-p", help="Port for the API server."
+    ),
+    log_level: str = typer.Option(
+        "info", "--log-level", help="Uvicorn log level for the API server."
+    ),
+    workers: int = typer.Option(
+        4, "--workers", "-w", help="Number of uvicorn worker processes."
+    ),
+    poll_interval: float = typer.Option(
+        2.0, "--poll-interval", help="Scheduler poll interval in seconds."
+    ),
+    max_workers: int = typer.Option(
+        64, "--max-workers", help="Maximum concurrent jobs for the scheduler."
+    ),
+    svc_env_file: typing.Optional[pathlib.Path] = typer.Option(
+        None, "--svc-env-file",
+        help="Absolute path to .env file embedded in the unit files (optional).",
+    ),
+    enable: bool = typer.Option(
+        True, "--enable/--no-enable",
+        help="Enable services to start automatically on boot.",
+    ),
+) -> None:
+    """
+    Generate and install systemd unit files for the qjob services.
+
+    Writes qjob-server.service and qjob-scheduler.service to
+    /etc/systemd/system/, reloads the systemd daemon, and optionally
+    enables both services.  Run 'qjob up' to start them immediately.
+    """
+
+    import subprocess
+
+    if os.getuid() != 0:
+        typer.echo("Error: 'qjob admin install' must be run as root.", err=True)
+        raise typer.Exit(code=1)
+
+    qjob_bin = _resolve_qjob_bin()
+
+    env_file_str: str | None = None
+    if svc_env_file is not None:
+        env_file_str = str(svc_env_file.resolve())
+
+    server_path = _SYSTEMD_DIR / _SERVER_UNIT
+    scheduler_path = _SYSTEMD_DIR / _SCHEDULER_UNIT
+
+    server_path.write_text(
+        _server_unit_content(qjob_bin, host, port, log_level, workers, env_file_str)
+    )
+    typer.echo(f"Written {server_path}")
+
+    scheduler_path.write_text(
+        _scheduler_unit_content(qjob_bin, poll_interval, max_workers, env_file_str)
+    )
+    typer.echo(f"Written {scheduler_path}")
+
+    try:
+        subprocess.run(["systemctl", "daemon-reload"], check=True)
+        typer.echo("Reloaded systemd daemon.")
+
+        if enable:
+            subprocess.run(
+                ["systemctl", "enable", _SERVER_UNIT, _SCHEDULER_UNIT], check=True
+            )
+            typer.echo("Services enabled (will start on boot).")
+    except subprocess.CalledProcessError as exc:
+        typer.echo(f"Error: systemctl exited with code {exc.returncode}.", err=True)
+        raise typer.Exit(code=1)
+
+    typer.echo("Run 'qjob up' to start the services now.")
+
+
+@admin_app.command("uninstall")
+def admin_uninstall() -> None:
+    """
+    Stop, disable, and remove qjob systemd unit files.
+
+    Stops the services if running, disables them, removes the unit files
+    from /etc/systemd/system/, and reloads the systemd daemon.
+    """
+
+    import subprocess
+
+    if os.getuid() != 0:
+        typer.echo("Error: 'qjob admin uninstall' must be run as root.", err=True)
+        raise typer.Exit(code=1)
+
+    # Stop and disable — ignore errors (services may not be running/enabled).
+    subprocess.run(["systemctl", "stop", _SCHEDULER_UNIT, _SERVER_UNIT])
+    subprocess.run(["systemctl", "disable", _SERVER_UNIT, _SCHEDULER_UNIT])
+
+    for path in (_SYSTEMD_DIR / _SERVER_UNIT, _SYSTEMD_DIR / _SCHEDULER_UNIT):
+        if path.exists():
+            path.unlink()
+            typer.echo(f"Removed {path}")
+        else:
+            typer.echo(f"Not found, skipping: {path}")
+
+    try:
+        subprocess.run(["systemctl", "daemon-reload"], check=True)
+    except subprocess.CalledProcessError as exc:
+        typer.echo(f"Error: systemctl exited with code {exc.returncode}.", err=True)
+        raise typer.Exit(code=1)
+
+    typer.echo("Services uninstalled.")
+
+
+# --------------------------------------------------------------------------------------
+# systemd unit-file helpers
+
+
+def _resolve_qjob_bin() -> str:
+    """Return the absolute path to the qjob executable."""
+    import shutil
+    path = shutil.which("qjob")
+    if path:
+        return str(pathlib.Path(path).resolve())
+    # Fallback: derive from the package location (works inside a venv).
+    import sys
+    return str(pathlib.Path(sys.argv[0]).resolve())
+
+
+def _server_unit_content(
+    qjob_bin:  str,
+    host:      str,
+    port:      int,
+    log_level: str,
+    workers:   int,
+    env_file:  str | None,
+) -> str:
+    env_flag = f"--env-file {env_file} " if env_file else ""
+    return (
+        "[Unit]\n"
+        "Description=qjob API server\n"
+        "After=network.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"ExecStart={qjob_bin} {env_flag}"
+        f"admin serve --host {host} --port {port} "
+        f"--log-level {log_level} --workers {workers}\n"
+        "Restart=on-failure\n"
+        "RestartSec=5\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
+
+
+def _scheduler_unit_content(
+    qjob_bin:      str,
+    poll_interval: float,
+    max_workers:   int,
+    env_file:      str | None,
+) -> str:
+    env_flag = f"--env-file {env_file} " if env_file else ""
+    return (
+        "[Unit]\n"
+        "Description=qjob job scheduler\n"
+        "After=network.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"ExecStart={qjob_bin} {env_flag}"
+        f"admin scheduler --poll-interval {poll_interval} --max-workers {max_workers}\n"
+        "Restart=on-failure\n"
+        "RestartSec=5\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
 
 
 # --------------------------------------------------------------------------------------

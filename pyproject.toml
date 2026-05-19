@@ -29,4 +29,8 @@ build-backend = "hatchling.build"
 testpaths = ["tests"]
 
 [dependency-groups]
-dev = ["pytest>=9.0.3", "pytest-xdist[psutil]>=3.8.0"]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-xdist[psutil]>=3.8.0",
+    "torch>=2.12.0",
+]

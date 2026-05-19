@@ -9,6 +9,14 @@ echo "job_name=${QJOB_JOB_NAME:-}"
 echo "user=${QJOB_USER:-}"
 echo "cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-}"
 
+if [ -f .venv/bin/activate ]; then
+  source .venv/bin/activate
+fi
+
+if command -v nvidia-smi >/dev/null 2>&1; then
+  nvidia-smi --query-gpu=index,name,memory.total --format=csv
+fi
+
 python3 - <<'PY'
 import os
 import time
@@ -27,11 +35,13 @@ except ImportError:
         time.sleep(1)
 else:
     device_count = torch.cuda.device_count()
+    devices = [f'cuda:{i}' for i in range(device_count)]
     print("torch visible GPU count =", device_count)
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    x = torch.randn(1024, 1024, device=device)
-    for step in range(1, 6):
-        x = x @ x.T
+
+    for step in range(1, 60):
+        for device in devices:
+            x = torch.randn(1024, 1024, device=device)
+            x = x @ x.T
         print(f"step={step} norm={x.norm().item():.4f}")
         time.sleep(1)
 

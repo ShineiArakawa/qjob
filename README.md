@@ -1,6 +1,6 @@
 # qjob
 
-qjob is a lightweight job scheduler for lab-scale research servers. It allows users to submit ordinary shell scripts annotated with `#QJOB` directives, and dispatches them while accounting for CPU cores, GPU devices, memory, walltime, user ownership, and job priority.
+qjob is a lightweight job scheduler for single-node lab-scale GPU servers. It allows users to submit ordinary shell scripts annotated with `#QJOB` directives, and dispatches them while accounting for CPU cores, GPU devices, memory, walltime, user ownership, and job priority.
 
 The project is intended for small to medium shared GPU servers used in research laboratories, where a full HPC scheduler may be unnecessary but unmanaged execution can easily lead to resource conflicts.
 
@@ -11,11 +11,9 @@ The project is intended for small to medium shared GPU servers used in research 
 - Priority aging and EASY-style backfilling.
 - PostgreSQL-backed persistent job and resource state.
 - FastAPI-based REST API with Bearer-token authentication.
-- Administrative token issuance and resource configuration commands.
+- systemd service integration with `qjob up` / `qjob down` for single-command startup.
 - Root-managed execution with privilege dropping to the submitting OS user.
 - CPU affinity via `taskset` and GPU assignment through `CUDA_VISIBLE_DEVICES`.
-- Safe cancellation path using a `cancelling` state, process-group signalling, and SIGKILL escalation.
-- Bounded log retrieval for stdout and stderr.
 - Terminal dashboard for local resource and queue monitoring.
 
 ## Requirements
@@ -92,42 +90,65 @@ Administrative users are determined by either:
 
 If `QJOB_ADMIN_USERS` is not set, `root` is treated as the default admin user.
 
-### 2. Start the API server
+### 2. Install and start as systemd services
+
+The recommended way to run qjob in production is as a pair of systemd services. This provides automatic restart on failure and OS-boot startup.
+
+Generate the unit files and enable both services:
+
+```bash
+sudo qjob admin install \
+  --svc-env-file /absolute/path/to/.env
+```
+
+`--svc-env-file` embeds the path to your `.env` file into the unit files so that `QJOB_DB_URL` and other variables are loaded automatically. The path must be absolute.
+
+Additional options mirror those of the manual commands:
+
+```bash
+sudo qjob admin install \
+  --svc-env-file /absolute/path/to/.env \
+  --host 127.0.0.1 --port 8000 --log-level info --workers 1 \
+  --poll-interval 2.0 --max-workers 64
+```
+
+By default both services are enabled to start on boot (`--no-enable` to opt out). After installation, start them immediately:
+
+```bash
+sudo qjob up
+```
+
+To stop both services:
+
+```bash
+sudo qjob down
+```
+
+To remove the unit files entirely:
+
+```bash
+sudo qjob admin uninstall
+```
+
+If the project directory is moved, re-run `qjob admin install` so that the unit files are updated with the new binary path.
+
+**Note on server binding:** By default, the server listens on `127.0.0.1:8000`. This is appropriate for single-node deployments where users access qjob on the same host. If binding to a non-local interface, place the service behind an appropriate network security boundary.
+
+### Starting services manually (development / one-off)
+
+For development or debugging, the server and scheduler can be started directly without systemd:
 
 ```bash
 sudo QJOB_DB_URL="postgresql+psycopg://qjob:your_password@localhost:5432/qjob" \
   qjob admin serve
-```
 
-By default, the server listens on `127.0.0.1:8000`. This local binding is appropriate for single-node deployments where users access qjob on the same host. If binding to a non-local interface, place the service behind an appropriate network security boundary.
-
-Useful options:
-
-```bash
-qjob admin serve --host 127.0.0.1 --port 8000 --log-level info
-qjob admin serve --workers 4
-```
-
-`--reload` is intended for development and cannot be combined with multiple workers.
-
-### 3. Start the scheduler
-
-Run the scheduler as a separate process:
-
-```bash
 sudo QJOB_DB_URL="postgresql+psycopg://qjob:your_password@localhost:5432/qjob" \
   qjob admin scheduler
 ```
 
-Useful options:
+Only one scheduler should be active at a time. The implementation uses a PostgreSQL advisory lock so that a second scheduler process exits instead of dispatching jobs concurrently.
 
-```bash
-qjob admin scheduler --poll-interval 2.0 --max-workers 64
-```
-
-Only one scheduler should be active. The implementation uses a PostgreSQL advisory lock so that a second scheduler process exits instead of dispatching jobs concurrently.
-
-### 4. Configure node resources
+### 3. Configure node resources
 
 Set the total resources managed by qjob:
 
@@ -196,7 +217,7 @@ python train.py
 | `--gpus <N>` | Number of GPU devices requested. Must be zero or greater. | `0` |
 | `--mem <SIZE>` | Memory request. Accepts values such as `512M`, `8G`, or `1T`. A unitless value is interpreted as bytes. | `1G` |
 | `--walltime <HH:MM:SS>` | Maximum wall-clock runtime. `MM:SS` is also accepted. | unlimited, or admin maximum if configured |
-| `--priority <LEVEL|N>` | Scheduling priority. `low`, `normal`, `high`, or integer `0` to `100`. | `normal` (`50`) |
+| `--priority <LEVEL\|N>` | Scheduling priority. `low`, `normal`, `high`, or integer `0` to `100`. | `normal` (`50`) |
 | `--env <KEY[,KEY...]>` | Parsed as a list of environment variable names. The current runner still starts from the scheduler environment; this option is therefore metadata rather than a strict allow-list. | none |
 
 Priority labels map to the following values:
@@ -298,12 +319,16 @@ The dashboard reads the local database directly and is intended for use on the q
 
 | Command | Purpose |
 | --- | --- |
+| `qjob up` | Start the API server and scheduler via systemd. Requires root. |
+| `qjob down` | Stop both services via systemd. Requires root. |
+| `qjob admin install` | Generate systemd unit files, reload the daemon, and optionally enable services. Requires root. |
+| `qjob admin uninstall` | Stop, disable, and remove the systemd unit files. Requires root. |
 | `qjob admin create-token <username>` | Create a token directly in the database. Requires root. Used for bootstrap or recovery. |
 | `qjob admin init-token [--username USER]` | Create a token through the API. Requires an admin token. |
 | `qjob admin set-resources` | Update total CPUs, GPUs, memory, or maximum walltime. Requires admin privileges. |
 | `qjob admin list-jobs` | List jobs across all users. Requires admin privileges. |
-| `qjob admin serve` | Start the FastAPI server. Requires root. |
-| `qjob admin scheduler` | Start the scheduler. Requires root. |
+| `qjob admin serve` | Start the FastAPI server directly (without systemd). Requires root. |
+| `qjob admin scheduler` | Start the scheduler directly (without systemd). Requires root. |
 
 ## Job Lifecycle
 
@@ -410,4 +435,3 @@ qjob submit train.sh
 qjob status
 qjob log <job_id>
 ```
-
