@@ -18,7 +18,7 @@ print("Starting CPU-only workload")
 payload = b"qjob-cpu-demo" * 100_000
 digest = ""
 
-for step in range(1, 6):
+for step in range(1, 120):
     digest = hashlib.sha256(payload + str(step).encode()).hexdigest()
     print(f"step={step} digest={digest[:16]}")
     time.sleep(1)

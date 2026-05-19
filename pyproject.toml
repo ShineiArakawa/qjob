@@ -1,7 +1,7 @@
 [project]
 name = "qjob"
-version = "0.1.0"
-description = "A lightweight job scheduler designed for lab-scale GPU servers"
+version = "1.0.0"
+description = "A lightweight job scheduler designed for lab-scale GPU servers."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -29,7 +29,4 @@ build-backend = "hatchling.build"
 testpaths = ["tests"]
 
 [dependency-groups]
-dev = [
-    "pytest>=9.0.3",
-    "pytest-xdist[psutil]>=3.8.0",
-]
+dev = ["pytest>=9.0.3", "pytest-xdist[psutil]>=3.8.0"]

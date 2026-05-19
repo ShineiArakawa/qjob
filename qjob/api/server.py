@@ -56,7 +56,7 @@ def create_app(db_url: str | None = None) -> fastapi.FastAPI:
 
     app = fastapi.FastAPI(
         title="qjob API",
-        description="Lightweight job scheduler for research servers.",
+        description="A lightweight job scheduler designed for lab-scale GPU servers.",
         version="0.2.0",
         lifespan=lifespan,
     )
