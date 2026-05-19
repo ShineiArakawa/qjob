@@ -345,8 +345,46 @@ class TestFetchQueuedOrdering:
 # Scheduler._recover_interrupted_jobs
 
 
+class TestCountRunning:
+    """_count_running() counts both RUNNING and CANCELLING jobs."""
+
+    def test_counts_running_job(self):
+        job = _make_job(status=models.JobStatus.RUNNING)
+        with database.get_session() as session:
+            session.add(job)
+        sched = scheduler.Scheduler()
+        with database.get_session() as session:
+            assert sched._count_running(session) >= 1
+
+    def test_counts_cancelling_job(self):
+        job = _make_job(status=models.JobStatus.CANCELLING)
+        with database.get_session() as session:
+            session.add(job)
+        sched = scheduler.Scheduler()
+        with database.get_session() as session:
+            assert sched._count_running(session) >= 1
+
+    def test_does_not_count_queued_job(self):
+        job = _make_job(status=models.JobStatus.QUEUED)
+        with database.get_session() as session:
+            session.add(job)
+        sched = scheduler.Scheduler()
+        with database.get_session() as session:
+            count_before = sched._count_running(session)
+        # Add a second QUEUED job and confirm count unchanged.
+        job2 = _make_job(status=models.JobStatus.QUEUED)
+        with database.get_session() as session:
+            session.add(job2)
+        with database.get_session() as session:
+            assert sched._count_running(session) == count_before
+
+
+# --------------------------------------------------------------------------------------
+# Scheduler._recover_interrupted_jobs
+
+
 class TestRecoverInterruptedJobs:
-    """Orphaned RUNNING jobs are reset to FAILED on scheduler startup."""
+    """Orphaned RUNNING and CANCELLING jobs are reset to FAILED on scheduler startup."""
 
     def test_orphaned_jobs_set_to_failed(self):
         orphan = _make_job(status=models.JobStatus.RUNNING)
@@ -382,6 +420,39 @@ class TestRecoverInterruptedJobs:
         with database.get_session() as session:
             row = session.get(models.Resource, 1)
             assert row.used_cpus == 0
+
+    def test_cancelling_orphan_set_to_failed(self):
+        orphan = _make_job(status=models.JobStatus.CANCELLING)
+        orphan.assigned_cpus = json.dumps([0])
+        orphan.assigned_gpus = json.dumps([])
+        with database.get_session() as session:
+            session.add(orphan)
+
+        sched = scheduler.Scheduler()
+        sched._recover_interrupted_jobs()
+
+        with database.get_session() as session:
+            recovered = session.get(models.Job, orphan.id)
+            assert recovered.status == models.JobStatus.FAILED
+
+    def test_cancelling_orphan_releases_resources(self):
+        with database.get_session() as session:
+            row = session.get(models.Resource, 1)
+            row.total_gpus = 2
+            row.used_gpus = 1
+
+        orphan = _make_job(req_gpus=1, status=models.JobStatus.CANCELLING)
+        orphan.assigned_cpus = json.dumps([])
+        orphan.assigned_gpus = json.dumps([0])
+        with database.get_session() as session:
+            session.add(orphan)
+
+        sched = scheduler.Scheduler()
+        sched._recover_interrupted_jobs()
+
+        with database.get_session() as session:
+            row = session.get(models.Resource, 1)
+            assert row.used_gpus == 0
 
 
 # --------------------------------------------------------------------------------------

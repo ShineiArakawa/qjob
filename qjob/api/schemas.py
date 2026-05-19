@@ -149,12 +149,13 @@ class ResourceResponse(pydantic.BaseModel):
         Memory currently allocated to running jobs in megabytes.
     """
 
-    total_cpus:   int
-    total_gpus:   int
-    total_mem_mb: int
-    used_cpus:    int
-    used_gpus:    int
-    used_mem_mb:  int
+    total_cpus:       int
+    total_gpus:       int
+    total_mem_mb:     int
+    max_walltime_sec: int | None
+    used_cpus:        int
+    used_gpus:        int
+    used_mem_mb:      int
 
 
 class ResourceUpdateRequest(pydantic.BaseModel):
@@ -173,9 +174,10 @@ class ResourceUpdateRequest(pydantic.BaseModel):
         New total memory in megabytes.
     """
 
-    total_cpus: int | None = pydantic.Field(default=None, gt=0)
-    total_gpus: int | None = pydantic.Field(default=None, ge=0)
-    total_mem_mb: int | None = pydantic.Field(default=None, gt=0)
+    total_cpus:       int | None = pydantic.Field(default=None, gt=0)
+    total_gpus:       int | None = pydantic.Field(default=None, ge=0)
+    total_mem_mb:     int | None = pydantic.Field(default=None, gt=0)
+    max_walltime_sec: int | None = pydantic.Field(default=None, gt=0)
 
     @pydantic.model_validator(mode="after")
     def at_least_one_field(self) -> ResourceUpdateRequest:
@@ -193,8 +195,8 @@ class ResourceUpdateRequest(pydantic.BaseModel):
             If all fields are None.
         """
 
-        if all(v is None for v in (self.total_cpus, self.total_gpus, self.total_mem_mb)):
-            raise ValueError("At least one of total_cpus, total_gpus, total_mem_mb must be set.")
+        if all(v is None for v in (self.total_cpus, self.total_gpus, self.total_mem_mb, self.max_walltime_sec)):
+            raise ValueError("At least one of total_cpus, total_gpus, total_mem_mb, max_walltime_sec must be set.")
         return self
 
 

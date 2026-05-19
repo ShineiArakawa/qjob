@@ -226,7 +226,10 @@ class ResourcePool:
 
         running_jobs = (
             session.query(models.Job)
-            .filter(models.Job.status == models.JobStatus.RUNNING)
+            .filter(models.Job.status.in_([
+                models.JobStatus.RUNNING,
+                models.JobStatus.CANCELLING,
+            ]))
             .all()
         )
         for rj in running_jobs:
@@ -463,11 +466,14 @@ class Scheduler:
     # -- Helpers -----------------------------------------------------------------------
 
     def _count_running(self, session: sqlalchemy.orm.Session) -> int:
-        """Return the number of jobs currently in RUNNING state."""
+        """Return the number of jobs currently occupying a worker slot."""
 
         return (
             session.query(models.Job)
-            .filter(models.Job.status == models.JobStatus.RUNNING)
+            .filter(models.Job.status.in_([
+                models.JobStatus.RUNNING,
+                models.JobStatus.CANCELLING,
+            ]))
             .count()
         )
 
@@ -748,7 +754,10 @@ class Scheduler:
         occupied_gpus: set[int] = set(reserved_gpu_ids or set())
         running_jobs = (
             session.query(models.Job)
-            .filter(models.Job.status == models.JobStatus.RUNNING)
+            .filter(models.Job.status.in_([
+                models.JobStatus.RUNNING,
+                models.JobStatus.CANCELLING,
+            ]))
             .all()
         )
         for rj in running_jobs:
@@ -876,7 +885,10 @@ class Scheduler:
         with database.get_session_for_update() as session:
             orphans = (
                 session.query(models.Job)
-                .filter(models.Job.status == models.JobStatus.RUNNING)
+                .filter(models.Job.status.in_([
+                    models.JobStatus.RUNNING,
+                    models.JobStatus.CANCELLING,
+                ]))
                 .all()
             )
             if not orphans:

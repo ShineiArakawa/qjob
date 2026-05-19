@@ -8,6 +8,7 @@ import os
 import pathlib
 import signal
 
+import coolname
 import sqlalchemy.orm
 
 import qjob.core.database as database
@@ -106,12 +107,13 @@ class ResourceInfo:
         Memory currently allocated to running jobs in megabytes.
     """
 
-    total_cpus:   int
-    total_gpus:   int
-    total_mem_mb: int
-    used_cpus:    int
-    used_gpus:    int
-    used_mem_mb:  int
+    total_cpus:       int
+    total_gpus:       int
+    total_mem_mb:     int
+    max_walltime_sec: int | None
+    used_cpus:        int
+    used_gpus:        int
+    used_mem_mb:      int
 
 
 @dataclasses.dataclass
@@ -174,6 +176,22 @@ def submit_job(
 
     resolved_user = user or getpass.getuser()
     directives = parser.parse_script(pathlib.Path(script_path))
+    if directives.name is None:
+        directives.name = coolname.generate_slug(2)
+
+    with database.get_session() as session:
+        resource_row: models.Resource | None = session.get(models.Resource, 1)
+        max_walltime = resource_row.max_walltime_sec if resource_row is not None else None
+
+    if max_walltime is not None:
+        if directives.walltime_sec is None:
+            directives.walltime_sec = max_walltime
+        elif directives.walltime_sec > max_walltime:
+            raise ValueError(
+                f"Requested walltime {directives.walltime_sec}s exceeds "
+                f"the maximum allowed {max_walltime}s."
+            )
+
     resolved_workdir = _resolve_workdir(workdir, directives.script_path)
     job = models.Job.from_directives(
         directives,
@@ -317,6 +335,7 @@ def cancel_job(job_id: str, user: str | None = None) -> JobInfo | None:
             models.JobStatus.DONE,
             models.JobStatus.FAILED,
             models.JobStatus.CANCELLED,
+            models.JobStatus.CANCELLING,
         }
         if job.status in terminal:
             job_status = job.status.value if isinstance(job.status, models.JobStatus) else job.status
@@ -332,9 +351,12 @@ def cancel_job(job_id: str, user: str | None = None) -> JobInfo | None:
                     os.kill(job.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+            job.status = models.JobStatus.CANCELLING
+        else:
+            # QUEUED jobs have no process — terminate immediately.
+            job.status = models.JobStatus.CANCELLED
+            job.finished_at = datetime.datetime.now(datetime.timezone.utc)
 
-        job.status = models.JobStatus.CANCELLED
-        job.finished_at = datetime.datetime.now(datetime.timezone.utc)
         return _job_to_info(job)
 
 
@@ -418,6 +440,7 @@ def get_resources() -> ResourceInfo:
         if row is None:
             return ResourceInfo(
                 total_cpus=0, total_gpus=0, total_mem_mb=0,
+                max_walltime_sec=None,
                 used_cpus=0,  used_gpus=0,  used_mem_mb=0,
             )
 
@@ -425,6 +448,7 @@ def get_resources() -> ResourceInfo:
             total_cpus=row.total_cpus,
             total_gpus=row.total_gpus,
             total_mem_mb=row.total_mem_mb,
+            max_walltime_sec=row.max_walltime_sec,
             used_cpus=row.used_cpus,
             used_gpus=row.used_gpus,
             used_mem_mb=row.used_mem_mb,
@@ -432,9 +456,10 @@ def get_resources() -> ResourceInfo:
 
 
 def set_resources(
-    total_cpus:   int | None = None,
-    total_gpus:   int | None = None,
-    total_mem_mb: int | None = None,
+    total_cpus:       int | None = None,
+    total_gpus:       int | None = None,
+    total_mem_mb:     int | None = None,
+    max_walltime_sec: int | None = None,
 ) -> ResourceInfo:
     """
     Update the resource limits.
@@ -459,7 +484,7 @@ def set_resources(
         If all arguments are ``None``.
     """
 
-    if total_cpus is None and total_gpus is None and total_mem_mb is None:
+    if total_cpus is None and total_gpus is None and total_mem_mb is None and max_walltime_sec is None:
         raise ValueError("At least one resource field must be specified.")
     if total_cpus is not None and total_cpus <= 0:
         raise ValueError("total_cpus must be greater than 0.")
@@ -467,6 +492,8 @@ def set_resources(
         raise ValueError("total_gpus must be greater than or equal to 0.")
     if total_mem_mb is not None and total_mem_mb <= 0:
         raise ValueError("total_mem_mb must be greater than 0.")
+    if max_walltime_sec is not None and max_walltime_sec <= 0:
+        raise ValueError("max_walltime_sec must be greater than 0.")
 
     with database.get_session() as session:
         row: models.Resource | None = session.get(models.Resource, 1)
@@ -480,6 +507,8 @@ def set_resources(
             row.total_gpus = total_gpus
         if total_mem_mb is not None:
             row.total_mem_mb = total_mem_mb
+        if max_walltime_sec is not None:
+            row.max_walltime_sec = max_walltime_sec
 
         row.updated_at = datetime.datetime.now(datetime.timezone.utc)
 
@@ -487,6 +516,7 @@ def set_resources(
             total_cpus=row.total_cpus,
             total_gpus=row.total_gpus,
             total_mem_mb=row.total_mem_mb,
+            max_walltime_sec=row.max_walltime_sec,
             used_cpus=row.used_cpus,
             used_gpus=row.used_gpus,
             used_mem_mb=row.used_mem_mb,

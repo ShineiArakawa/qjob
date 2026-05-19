@@ -127,12 +127,13 @@ class ResourceInfo:
         Memory currently allocated to running jobs in megabytes.
     """
 
-    total_cpus:   int
-    total_gpus:   int
-    total_mem_mb: int
-    used_cpus:    int
-    used_gpus:    int
-    used_mem_mb:  int
+    total_cpus:       int
+    total_gpus:       int
+    total_mem_mb:     int
+    max_walltime_sec: int | None
+    used_cpus:        int
+    used_gpus:        int
+    used_mem_mb:      int
 
 
 # --------------------------------------------------------------------------------------
@@ -302,9 +303,10 @@ def get_resources() -> ResourceInfo:
 
 
 def set_resources(
-    total_cpus:   int | None = None,
-    total_gpus:   int | None = None,
-    total_mem_mb: int | None = None,
+    total_cpus:       int | None = None,
+    total_gpus:       int | None = None,
+    total_mem_mb:     int | None = None,
+    max_walltime_sec: int | None = None,
 ) -> ResourceInfo:
     """
     Update the resource limits (admin only).
@@ -317,6 +319,8 @@ def set_resources(
         New total GPU device count.
     total_mem_mb : int | None
         New total memory in megabytes.
+    max_walltime_sec : int | None
+        New maximum allowed walltime in seconds.
 
     Returns
     -------
@@ -329,9 +333,9 @@ def set_resources(
         If all arguments are None.
     """
 
-    if total_cpus is None and total_gpus is None and total_mem_mb is None:
+    if total_cpus is None and total_gpus is None and total_mem_mb is None and max_walltime_sec is None:
         raise ValueError("At least one resource field must be specified.")
-    return _run(_async_set_resources(total_cpus, total_gpus, total_mem_mb))
+    return _run(_async_set_resources(total_cpus, total_gpus, total_mem_mb, max_walltime_sec))
 
 
 # --------------------------------------------------------------------------------------
@@ -476,9 +480,10 @@ async def _async_get_resources() -> ResourceInfo:
 
 
 async def _async_set_resources(
-    total_cpus:   int | None,
-    total_gpus:   int | None,
-    total_mem_mb: int | None,
+    total_cpus:       int | None,
+    total_gpus:       int | None,
+    total_mem_mb:     int | None,
+    max_walltime_sec: int | None,
 ) -> ResourceInfo:
     """Async implementation of set_resources."""
 
@@ -489,6 +494,8 @@ async def _async_set_resources(
         body["total_gpus"] = total_gpus
     if total_mem_mb is not None:
         body["total_mem_mb"] = total_mem_mb
+    if max_walltime_sec is not None:
+        body["max_walltime_sec"] = max_walltime_sec
 
     async with _async_client() as client:
         response = await client.put("/resources", json=body)
@@ -592,6 +599,7 @@ def _parse_resource(data: dict) -> ResourceInfo:
         total_cpus=data["total_cpus"],
         total_gpus=data["total_gpus"],
         total_mem_mb=data["total_mem_mb"],
+        max_walltime_sec=data.get("max_walltime_sec"),
         used_cpus=data["used_cpus"],
         used_gpus=data["used_gpus"],
         used_mem_mb=data["used_mem_mb"],

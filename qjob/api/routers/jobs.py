@@ -56,6 +56,8 @@ def submit_job(body: schemas.JobSubmitRequest) -> schemas.JobResponse:
         raise fastapi.HTTPException(status_code=422, detail=str(exc))
     except crud.parser.DirectiveParseError as exc:
         raise fastapi.HTTPException(status_code=422, detail=str(exc))
+    except ValueError as exc:
+        raise fastapi.HTTPException(status_code=422, detail=str(exc))
 
     return _info_to_response(info)
 

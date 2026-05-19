@@ -58,7 +58,7 @@ def _main(
 
 
 def _complete_status(incomplete: str) -> list[str]:
-    values = ["queued", "running", "done", "failed", "cancelled"]
+    values = ["queued", "running", "cancelling", "done", "failed", "cancelled"]
     return [v for v in values if v.startswith(incomplete)]
 
 
@@ -422,18 +422,34 @@ def admin_set_resources(
     mem: typing.Optional[int] = typer.Option(
         None, "--mem", help="Total memory in megabytes."
     ),
+    max_walltime: typing.Optional[str] = typer.Option(
+        None, "--max-walltime", help="Maximum allowed walltime per job (HH:MM:SS or MM:SS)."
+    ),
 ) -> None:
     """Update the available resource limits."""
 
-    if cpus is None and gpus is None and mem is None:
-        typer.echo("Error: specify at least one of --cpus, --gpus, --mem.", err=True)
+    if cpus is None and gpus is None and mem is None and max_walltime is None:
+        typer.echo(
+            "Error: specify at least one of --cpus, --gpus, --mem, --max-walltime.",
+            err=True,
+        )
         raise typer.Exit(code=1)
+
+    max_walltime_sec: int | None = None
+    if max_walltime is not None:
+        try:
+            import qjob.core.parser as _parser
+            max_walltime_sec = _parser._parse_walltime(max_walltime)
+        except _parser.DirectiveParseError as exc:
+            typer.echo(f"Error: {exc}", err=True)
+            raise typer.Exit(code=1)
 
     try:
         info = service.set_resources(
             total_cpus=cpus,
             total_gpus=gpus,
             total_mem_mb=mem,
+            max_walltime_sec=max_walltime_sec,
         )
     except ValueError as exc:
         typer.echo(f"Error: {exc}", err=True)
@@ -522,22 +538,34 @@ def _print_job_detail(info: service.JobInfo) -> None:
     typer.echo("\n".join(lines))
 
 
+def _fmt_walltime(sec: int | None) -> str:
+    """Format seconds as HH:MM:SS, or '—' if None."""
+    if sec is None:
+        return "—"
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
 def _print_resources(info: service.ResourceInfo) -> None:
     """Print a resource summary table."""
 
-    typer.echo(f"{'RESOURCE':<10}  {'TOTAL':>8}  {'USED':>8}  {'FREE':>8}")
-    typer.echo("-" * 40)
+    typer.echo(f"{'RESOURCE':<12}  {'TOTAL':>10}  {'USED':>8}  {'FREE':>8}")
+    typer.echo("-" * 44)
     typer.echo(
-        f"{'CPUs':<10}  {info.total_cpus:>8}  {info.used_cpus:>8}  "
+        f"{'CPUs':<12}  {info.total_cpus:>10}  {info.used_cpus:>8}  "
         f"{info.total_cpus - info.used_cpus:>8}"
     )
     typer.echo(
-        f"{'GPUs':<10}  {info.total_gpus:>8}  {info.used_gpus:>8}  "
+        f"{'GPUs':<12}  {info.total_gpus:>10}  {info.used_gpus:>8}  "
         f"{info.total_gpus - info.used_gpus:>8}"
     )
     typer.echo(
-        f"{'Memory(MB)':<10}  {info.total_mem_mb:>8}  {info.used_mem_mb:>8}  "
+        f"{'Memory(MB)':<12}  {info.total_mem_mb:>10}  {info.used_mem_mb:>8}  "
         f"{info.total_mem_mb - info.used_mem_mb:>8}"
+    )
+    typer.echo(
+        f"{'Walltime':<12}  {_fmt_walltime(info.max_walltime_sec):>10}"
     )
 
 

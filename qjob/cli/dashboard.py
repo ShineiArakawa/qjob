@@ -86,7 +86,7 @@ def _build_layout(refresh_interval: float) -> rich.layout.Layout:
         all_jobs = []
         error_msg = str(exc)
 
-    running = [j for j in all_jobs if j.status == "running"]
+    running = [j for j in all_jobs if j.status in ("running", "cancelling")]
     queued = [j for j in all_jobs if j.status == "queued"]
     done = [j for j in all_jobs if j.status == "done"]
     failed = [j for j in all_jobs if j.status == "failed"]

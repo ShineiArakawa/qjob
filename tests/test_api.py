@@ -322,11 +322,27 @@ class TestCancelJob:
         assert response.status_code == 200
         assert response.json()["status"] == "cancelled"
 
-    def test_cancels_running_job(self, client):
+    def test_cancels_running_job_without_pid(self, client):
+        # No PID means no live process — cancel completes immediately.
         job = _persist_job(user="alice", status=models.JobStatus.RUNNING)
         response = client.delete(f"/jobs/{job.id}", params={"user": "alice"})
         assert response.status_code == 200
         assert response.json()["status"] == "cancelled"
+
+    def test_cancels_running_job_with_pid_becomes_cancelling(self, client):
+        # PID present — SIGTERM sent, status becomes CANCELLING until runner confirms exit.
+        job = _persist_job(user="alice", status=models.JobStatus.RUNNING)
+        with database.get_session() as session:
+            stored = session.get(models.Job, job.id)
+            stored.pid = 99999999  # Non-existent PID; ProcessLookupError is silently caught.
+        response = client.delete(f"/jobs/{job.id}", params={"user": "alice"})
+        assert response.status_code == 200
+        assert response.json()["status"] == "cancelling"
+
+    def test_returns_409_for_cancelling_job(self, client):
+        job = _persist_job(user="alice", status=models.JobStatus.CANCELLING)
+        response = client.delete(f"/jobs/{job.id}", params={"user": "alice"})
+        assert response.status_code == 409
 
     def test_returns_404_for_unknown_id(self, client):
         response = client.delete(

@@ -201,6 +201,30 @@ class TestDbTransitions:
         runner._mark_finished(job, exit_code=0, resource_pool=pool)
         assert pool.free_cpus == 8
 
+    def test_mark_finished_cancelling_sets_cancelled(self):
+        job = _make_job()
+        with database.get_session() as session:
+            stored = session.get(models.Job, job.id)
+            stored.status = models.JobStatus.CANCELLING
+        pool = _make_pool()
+        runner._mark_finished(job, exit_code=-15, resource_pool=pool)
+        with database.get_session() as session:
+            stored = session.get(models.Job, job.id)
+            assert stored.status == models.JobStatus.CANCELLED
+            assert stored.exit_code == -15
+            assert stored.finished_at is not None
+
+    def test_mark_finished_cancelled_preserves_cancelled(self):
+        job = _make_job()
+        with database.get_session() as session:
+            stored = session.get(models.Job, job.id)
+            stored.status = models.JobStatus.CANCELLED
+        pool = _make_pool()
+        runner._mark_finished(job, exit_code=-9, resource_pool=pool)
+        with database.get_session() as session:
+            stored = session.get(models.Job, job.id)
+            assert stored.status == models.JobStatus.CANCELLED
+
     def test_mark_failed_sets_status(self):
         job = _make_job()
         pool = _make_pool()

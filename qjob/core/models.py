@@ -26,6 +26,7 @@ class JobStatus(str, enum.Enum):
 
     QUEUED = "queued"
     RUNNING = "running"
+    CANCELLING = "cancelling"
     DONE = "done"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -260,6 +261,9 @@ class Resource(Base):
     )
     total_mem_mb: sqlalchemy.orm.Mapped[int] = sqlalchemy.orm.mapped_column(
         sqlalchemy.Integer, nullable=False, default=1024
+    )
+    max_walltime_sec: sqlalchemy.orm.Mapped[int | None] = sqlalchemy.orm.mapped_column(
+        sqlalchemy.Integer, nullable=True
     )
     used_cpus: sqlalchemy.orm.Mapped[int] = sqlalchemy.orm.mapped_column(
         sqlalchemy.Integer, nullable=False, default=0

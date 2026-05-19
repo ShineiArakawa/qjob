@@ -155,7 +155,14 @@ async def _run_job(job: models.Job, resource_pool: object) -> None:
     try:
         _mark_running(job, process.pid, stdout_path, stderr_path)
 
-        exit_code = await _wait_with_walltime(job, process)
+        wait_task = asyncio.create_task(_wait_with_walltime(job, process))
+        watchdog_task = asyncio.create_task(_cancel_watchdog(job, process))
+
+        try:
+            exit_code = await wait_task
+        finally:
+            watchdog_task.cancel()
+            await asyncio.gather(watchdog_task, return_exceptions=True)
 
         _mark_finished(job, exit_code, resource_pool)
     finally:
@@ -273,6 +280,34 @@ async def _wait_with_walltime(
             )
             _send_signal(process, signal.SIGKILL)
             return await process.wait()
+
+
+async def _cancel_watchdog(
+    job:     models.Job,
+    process: asyncio.subprocess.Process,
+) -> None:
+    """
+    Poll DB every 2 s for CANCELLING status and escalate to SIGKILL after grace period.
+
+    SIGTERM is already sent by cancel_job() in the API layer. This coroutine only
+    handles the case where the process ignores SIGTERM and must be force-killed.
+    """
+    while process.returncode is None:
+        await asyncio.sleep(2.0)
+        if process.returncode is not None:
+            return
+        with database.get_session() as session:
+            stored = session.get(models.Job, job.id)
+        if stored is None or stored.status == models.JobStatus.CANCELLING:
+            try:
+                await asyncio.wait_for(process.wait(), timeout=_SIGTERM_GRACE_SEC)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Job %s did not exit after SIGTERM. Sending SIGKILL.", job.id
+                )
+                _send_signal(process, signal.SIGKILL)
+                await process.wait()
+            return
 
 
 def _send_signal(process: asyncio.subprocess.Process, sig: signal.Signals) -> None:
@@ -418,9 +453,13 @@ def _mark_finished(
         if stored is None:
             return
 
-        if stored.status == models.JobStatus.CANCELLED:
+        if stored.status in (
+            models.JobStatus.CANCELLED,
+            models.JobStatus.CANCELLING,
+        ):
+            stored.status = models.JobStatus.CANCELLED
             stored.exit_code = exit_code
-            stored.finished_at = stored.finished_at or now
+            stored.finished_at = now
             final_status = models.JobStatus.CANCELLED
         else:
             stored.status = final_status
