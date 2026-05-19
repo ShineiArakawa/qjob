@@ -236,6 +236,13 @@ async def _spawn(
 
     cwd = job.workdir or str(pathlib.Path(job.script_path).resolve().parent)
 
+    stdout_path.touch(mode=0o644)
+    stderr_path.touch(mode=0o644)
+    if os.getuid() == 0:
+        pw = pwd.getpwnam(job.user)
+        os.chown(stdout_path, pw.pw_uid, pw.pw_gid)
+        os.chown(stderr_path, pw.pw_uid, pw.pw_gid)
+
     with stdout_path.open("wb") as fout, stderr_path.open("wb") as ferr:
         process = await asyncio.create_subprocess_exec(
             *argv,

@@ -395,9 +395,11 @@ async def _async_get_job(job_id: str) -> JobInfo | None:
 
     async with _async_client() as client:
         response = await client.get(f"/jobs/{job_id}")
+
     if response.status_code == 404:
         return None
     _raise_for_status(response)
+
     return _parse_job(response.json())
 
 
@@ -479,9 +481,9 @@ async def _async_cancel_job(job_id: str) -> JobInfo | None:
 
 
 async def _async_create_token(username: str) -> str:
-    """Async implementation of create_token. Does not use auth headers."""
+    """Async implementation of create_token. Uses admin auth headers."""
 
-    async with httpx.AsyncClient(base_url=_api_url(), timeout=_DEFAULT_TIMEOUT) as client:
+    async with _async_client() as client:
         response = await client.post("/auth/token", json={"username": username})
     _raise_for_status(response)
     return response.json()["token"]

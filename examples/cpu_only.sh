@@ -9,7 +9,7 @@ echo "job_name=${QJOB_JOB_NAME:-}"
 echo "user=${QJOB_USER:-}"
 echo "cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-}"
 
-python - <<'PY'
+python3 - <<'PY'
 import hashlib
 import time
 

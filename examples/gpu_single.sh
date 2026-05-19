@@ -13,7 +13,7 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi --query-gpu=index,name,memory.total --format=csv
 fi
 
-python - <<'PY'
+python3 - <<'PY'
 import os
 import time
 

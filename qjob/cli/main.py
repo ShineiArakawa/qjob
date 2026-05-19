@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib.metadata
 import os
+import pathlib
 import typing
 
 import typer
@@ -55,8 +56,15 @@ def _main(
         is_eager=True,
         help="Show version and exit.",
     ),
+    env_file: pathlib.Path = typer.Option(
+        pathlib.Path(".env"), "--env-file",
+        help="Path to .env file (loaded if it exists).",
+        is_eager=True,
+    ),
 ) -> None:
-    pass
+    # Load environment variables from the specified .env file, if it exists.
+    import dotenv
+    dotenv.load_dotenv(env_file, override=False)
 
 
 # --------------------------------------------------------------------------------------
@@ -341,6 +349,10 @@ def serve(
     as a separate process.  Press Ctrl+C to stop.
     """
 
+    if os.getuid() != 0:
+        typer.echo("Error: 'qjob serve' must be run as root.", err=True)
+        raise typer.Exit(code=1)
+
     if reload and workers > 1:
         typer.echo("Error: --reload and --workers cannot be combined.", err=True)
         raise typer.Exit(code=1)
@@ -373,6 +385,10 @@ def scheduler(
     Only one scheduler may run at a time; a second invocation will exit
     immediately with an error.  Press Ctrl+C to stop gracefully.
     """
+
+    if os.getuid() != 0:
+        typer.echo("Error: 'qjob scheduler' must be run as root.", err=True)
+        raise typer.Exit(code=1)
 
     try:
         database.init_db()
@@ -418,38 +434,109 @@ def dash(
 
 
 @auth_app.command("init")
-def auth_init() -> None:
+def auth_init(
+    username: typing.Optional[str] = typer.Option(
+        None, "--username", "-u",
+        help="OS username to create a token for (default: current user).",
+    ),
+) -> None:
     """
-    Create an API token for the current OS user and save it to
-    ~/.config/qjob/token.
+    Create an API token via the API server (admin privileges required).
 
-    The token is created on the server and stored locally with mode 0600.
-    Re-running this command creates an additional token (existing tokens
-    remain valid).
+    When --username is omitted the token is for the current OS user and is
+    saved to ~/.config/qjob/token automatically.  When --username names
+    another user the token is printed — distribute it to that user manually.
     """
 
     import getpass
     import stat
 
-    username = getpass.getuser()
+    current_user = getpass.getuser()
+    target = username or current_user
 
     try:
-        token = service.create_token(username)
+        token = service.create_token(target)
     except ConnectionError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1)
 
-    token_path = service._TOKEN_PATH
-    token_path.parent.mkdir(parents=True, exist_ok=True)
-    token_path.write_text(token)
-    token_path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600
+    if target == current_user:
+        token_path = service._TOKEN_PATH
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        token_path.write_text(token)
+        token_path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600
+        typer.echo(f"Token saved to {token_path}")
+    else:
+        typer.echo(f"Token for {target}: {token}")
+        typer.echo("Save this token — it will not be shown again.")
 
-    typer.echo(f"Token saved to {token_path}")
-    typer.echo(f"Authenticated as: {username}")
+    typer.echo(f"Authenticated as: {target}")
 
 
 # --------------------------------------------------------------------------------------
 # admin sub-commands
+
+
+@admin_app.command("create-token")
+def admin_create_token(
+    username: str = typer.Argument(..., help="OS username to create a token for."),
+) -> None:
+    """
+    Create an API token directly in the database (root only, no HTTP required).
+
+    Use this command to bootstrap the admin token before the server is running,
+    or when the API server is unavailable.  The token is saved to the target
+    user's ~/.config/qjob/token and also printed to stdout.
+    """
+
+    import hashlib
+    import pwd
+    import secrets
+    import stat
+
+    import qjob.core.models as _models
+
+    if os.getuid() != 0:
+        typer.echo("Error: 'qjob admin create-token' must be run as root.", err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        pw = pwd.getpwnam(username)
+    except KeyError:
+        typer.echo(f"Error: OS user {username!r} does not exist.", err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        database.init_db()
+    except RuntimeError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    with database.get_session() as session:
+        existing = (
+            session.query(_models.ApiToken)
+            .filter(_models.ApiToken.username == username)
+            .first()
+        )
+    if existing is not None:
+        typer.echo(f"Error: User {username!r} already has a token. Revoke it first.", err=True)
+        raise typer.Exit(code=1)
+
+    token = secrets.token_hex(32)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+
+    with database.get_session() as session:
+        row = _models.ApiToken(username=username, token_hash=token_hash)
+        session.add(row)
+
+    token_path = pathlib.Path(pw.pw_dir) / ".config" / "qjob" / "token"
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(token)
+    token_path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600
+    os.chown(token_path, pw.pw_uid, pw.pw_gid)
+
+    typer.echo(f"Token for {username}: {token}")
+    typer.echo(f"Token saved to {token_path}")
 
 
 @admin_app.command("set-resources")
