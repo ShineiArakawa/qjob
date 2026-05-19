@@ -63,7 +63,7 @@ CREATE DATABASE qjob OWNER qjob;
 
 ### 4. Create tables
 
-Tables are created automatically on the first run of `qjob serve` or `qjob scheduler` using `CREATE TABLE IF NOT EXISTS`. No manual migration is needed for a fresh deployment.
+Tables are created automatically on the first run of `qjob admin serve` or `qjob admin scheduler` using `CREATE TABLE IF NOT EXISTS`. No manual migration is needed for a fresh deployment.
 
 To apply schema changes to an existing database, use Alembic:
 
@@ -74,7 +74,9 @@ alembic upgrade head
 
 ---
 
-## Quick Start
+## Initial Setup
+
+This section walks through the one-time setup an administrator performs before any user can submit jobs.
 
 ### 1. Set the database URL
 
@@ -82,38 +84,88 @@ alembic upgrade head
 export QJOB_DB_URL="postgresql+psycopg://qjob:your_password@localhost:5432/qjob"
 ```
 
-### 2. Start the API server
+### 2. Bootstrap the admin token
+
+Create an API token for the admin user **directly in the database** (no server required). This must be run as root and is typically done once on first deployment.
 
 ```bash
-qjob serve
+sudo qjob admin create-token <admin_username>
+```
+
+The token is saved to `~/.config/qjob/token` under the admin's home directory and also printed to stdout.
+
+### 3. Start the API server
+
+```bash
+sudo qjob admin serve
 ```
 
 Listens on `127.0.0.1:8000` by default.
 
-### 3. Start the scheduler (separate terminal)
+### 4. Start the scheduler (separate terminal)
 
 ```bash
-qjob scheduler
+sudo qjob admin scheduler
 ```
 
 The API server and scheduler run as independent processes. The scheduler uses a PostgreSQL Advisory Lock to ensure only one instance runs at a time.
 
-### 4. Configure available resources
+### 5. Configure available resources
 
 ```bash
 qjob admin set-resources --cpus 32 --gpus 4 --mem 65536
 ```
 
-### 5. Submit a job
+---
+
+## User Management
+
+API tokens are required to use qjob. Tokens are issued by an administrator.
+
+### Adding a new user
+
+Run as an administrator (your token must be stored at `~/.config/qjob/token`):
 
 ```bash
-qjob submit examples/train.sh
+qjob admin init-token --username alice
 ```
 
-### 6. Check status
+- If `--username` is omitted, a token is created for the **current user** and saved to `~/.config/qjob/token` automatically.
+- If `--username` names another user, the token is **printed to stdout** — distribute it to that user manually.
+
+The user saves the token:
 
 ```bash
+mkdir -p ~/.config/qjob
+echo "<token>" > ~/.config/qjob/token
+chmod 600 ~/.config/qjob/token
+```
+
+### Bootstrapping without a running server
+
+If the API server is not yet available (e.g. first deployment), use `create-token` to write the token directly to the database. This requires root:
+
+```bash
+sudo qjob admin create-token alice
+```
+
+The token is saved to `alice`'s `~/.config/qjob/token` automatically.
+
+---
+
+## Quick Start (user)
+
+Once an administrator has issued your token:
+
+```bash
+# Submit a job
+qjob submit train.sh
+
+# Check your jobs
 qjob status
+
+# View logs
+qjob log <job_id>
 ```
 
 ---
@@ -198,6 +250,7 @@ Cancel a queued or running job.
 
 ```bash
 qjob cancel abc123def456
+qjob cancel --all                  # Cancel all your queued and running jobs
 ```
 
 ### `qjob log <JOB_ID>`
@@ -217,47 +270,69 @@ Show current resource availability.
 qjob resources
 ```
 
-### `qjob serve`
-
-Start the API server.
-
-```bash
-qjob serve                                 # Default settings
-qjob serve --host 0.0.0.0 --port 8080     # Bind to all interfaces
-qjob serve --workers 4                    # Multiple worker processes
-qjob serve --log-level debug              # Verbose logging
-```
-
-### `qjob scheduler`
-
-Start the scheduler process. Only one instance may run at a time; a second invocation exits immediately with an error.
-
-```bash
-qjob scheduler
-qjob scheduler --poll-interval 5.0        # Poll every 5 seconds
-qjob scheduler --max-workers 128          # Max concurrent jobs
-```
-
 ### `qjob dash`
 
-Open the live TUI dashboard (connects directly to the database).
+Open the live TUI dashboard.
 
 ```bash
 qjob dash
 qjob dash --refresh 5.0    # Refresh interval in seconds
 ```
 
-### `qjob admin set-resources`
+### `qjob admin` — Administrative commands
+
+All `admin` subcommands require root or admin privileges.
+
+#### `qjob admin serve`
+
+Start the API server.
+
+```bash
+qjob admin serve                                 # Default settings
+qjob admin serve --host 0.0.0.0 --port 8080     # Bind to all interfaces
+qjob admin serve --workers 4                     # Multiple worker processes
+qjob admin serve --log-level debug               # Verbose logging
+```
+
+#### `qjob admin scheduler`
+
+Start the scheduler process. Only one instance may run at a time.
+
+```bash
+qjob admin scheduler
+qjob admin scheduler --poll-interval 5.0         # Poll every 5 seconds
+qjob admin scheduler --max-workers 128           # Max concurrent jobs
+```
+
+#### `qjob admin init-token`
+
+Create an API token for a user **via the API server** (server must be running, admin token required).
+
+```bash
+qjob admin init-token                            # Token for current user
+qjob admin init-token --username alice           # Token for alice (printed to stdout)
+```
+
+#### `qjob admin create-token <username>`
+
+Create an API token **directly in the database** (root only, no server required). Use for initial bootstrapping.
+
+```bash
+sudo qjob admin create-token alice
+```
+
+#### `qjob admin set-resources`
 
 Update resource limits. `--mem` is in megabytes.
 
 ```bash
 qjob admin set-resources --cpus 32 --gpus 4 --mem 65536
+qjob admin set-resources --max-walltime 08:00:00
 ```
 
-### `qjob admin list-jobs`
+#### `qjob admin list-jobs`
 
-List all jobs from all users (admin view).
+List all jobs from all users.
 
 ```bash
 qjob admin list-jobs

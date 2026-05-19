@@ -212,10 +212,11 @@ def get_job(job_id: str) -> JobInfo | None:
 
 
 def list_jobs(
-    user:   str | None = None,
-    status: str | None = None,
-    limit:  int | None = None,
-    offset: int = 0,
+    user:      str | None = None,
+    all_users: bool = False,
+    status:    str | None = None,
+    limit:     int | None = None,
+    offset:    int = 0,
 ) -> list[JobInfo]:
     """
     Return a list of jobs, optionally filtered by user and/or status.
@@ -224,6 +225,8 @@ def list_jobs(
     ----------
     user : str | None
         When given, only jobs submitted by this user are returned.
+    all_users : bool
+        When True, request jobs from all users (subject to server-side auth).
     status : str | None
         When given, only jobs in this status are returned.
     limit : int | None
@@ -243,7 +246,7 @@ def list_jobs(
         If *status* is not a valid ``JobStatus`` value.
     """
 
-    return _run(_async_list_jobs(user, status, limit, offset))
+    return _run(_async_list_jobs(user, all_users, status, limit, offset))
 
 
 def cancel_job(job_id: str) -> JobInfo | None:
@@ -405,10 +408,11 @@ async def _async_get_job(job_id: str) -> JobInfo | None:
 
 
 async def _async_list_jobs(
-    user:   str | None,
-    status: str | None,
-    limit:  int | None,
-    offset: int,
+    user:      str | None,
+    all_users: bool,
+    status:    str | None,
+    limit:     int | None,
+    offset:    int,
 ) -> list[JobInfo]:
     """Async implementation of list_jobs."""
 
@@ -417,6 +421,7 @@ async def _async_list_jobs(
             payload = await _fetch_jobs_page(
                 client,
                 user=user,
+                all_users=all_users,
                 status=status,
                 limit=limit,
                 offset=offset,
@@ -430,6 +435,7 @@ async def _async_list_jobs(
             payload = await _fetch_jobs_page(
                 client,
                 user=user,
+                all_users=all_users,
                 status=status,
                 limit=page_size,
                 offset=next_offset,
@@ -442,11 +448,12 @@ async def _async_list_jobs(
 
 
 async def _fetch_jobs_page(
-    client: httpx.AsyncClient,
-    user:   str | None,
-    status: str | None,
-    limit:  int,
-    offset: int,
+    client:    httpx.AsyncClient,
+    user:      str | None,
+    all_users: bool,
+    status:    str | None,
+    limit:     int,
+    offset:    int,
 ) -> dict:
     """Fetch one /jobs page and return the decoded JSON payload."""
 
@@ -456,6 +463,8 @@ async def _fetch_jobs_page(
     }
     if user is not None:
         params["user"] = user
+    if all_users:
+        params["all_users"] = "true"
     if status is not None:
         params["status"] = status
 

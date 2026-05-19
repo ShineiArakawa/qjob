@@ -78,7 +78,8 @@ def submit_job(
     summary="List jobs",
 )
 def list_jobs(
-    user:         typing.Optional[str] = fastapi.Query(None, description="Filter by username (admin only)."),
+    user:         typing.Optional[str] = fastapi.Query(None, description="Filter by username."),
+    all_users:    bool = fastapi.Query(False, description="Show jobs from all users."),
     status:       typing.Optional[str] = fastapi.Query(None, description="Filter by status."),
     limit:        int = fastapi.Query(
         crud.DEFAULT_JOB_LIST_LIMIT,
@@ -92,13 +93,15 @@ def list_jobs(
     """
     Return jobs optionally filtered by user and/or status.
 
-    Non-admin users always see only their own jobs regardless of the *user*
-    query parameter.  Admins may filter by any user or omit *user* to see all.
+    Non-admin users see only their own jobs unless *all_users* is True.
+    Admins may filter by any user or omit *user* to see all.
 
     Parameters
     ----------
     user : str | None
-        Username filter.  Ignored for non-admin callers.
+        Username filter.  Ignored for non-admin callers when *all_users* is False.
+    all_users : bool
+        When True, non-admin users may see jobs from all users.
     status : str | None
         When given, only jobs in this status are returned.
     limit : int
@@ -115,7 +118,7 @@ def list_jobs(
     """
 
     if not auth.is_admin(current_user):
-        user = current_user
+        user = None if all_users else current_user
 
     try:
         page = crud.list_jobs(user=user, status=status, limit=limit, offset=offset)
@@ -162,7 +165,6 @@ def get_job(
     ------
     fastapi.HTTPException
         404 if no job with *job_id* exists.
-        403 if a non-admin user requests a job that is not theirs.
     """
 
     info = crud.get_job(job_id)
@@ -170,9 +172,6 @@ def get_job(
         raise fastapi.HTTPException(
             status_code=404, detail=f"Job {job_id!r} not found."
         )
-
-    if not auth.is_admin(current_user) and info.user != current_user:
-        raise fastapi.HTTPException(status_code=403, detail="Access denied.")
 
     return _info_to_response(info)
 

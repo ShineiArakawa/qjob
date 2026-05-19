@@ -79,7 +79,7 @@ def _build_layout(refresh_interval: float) -> rich.layout.Layout:
 
     try:
         resources = service.get_resources()
-        all_jobs = service.list_jobs()
+        all_jobs = service.list_jobs(all_users=True)
         error_msg = None
     except ConnectionError as exc:
         resources = None

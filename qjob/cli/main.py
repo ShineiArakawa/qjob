@@ -34,12 +34,6 @@ admin_app = typer.Typer(
 )
 app.add_typer(admin_app, name="admin")
 
-auth_app = typer.Typer(
-    help="Authentication commands.",
-    no_args_is_help=True,
-)
-app.add_typer(auth_app, name="auth")
-
 
 def _version_callback(value: bool) -> None:
     if value:
@@ -145,6 +139,10 @@ def status(
     Without arguments, lists jobs submitted by the current user.
     """
 
+    if all_users and user is not None:
+        typer.echo("Error: --all and --user cannot be combined.", err=True)
+        raise typer.Exit(code=1)
+
     if job_id is not None:
         try:
             info = service.get_job(job_id)
@@ -160,11 +158,12 @@ def status(
     resolved_user = None if all_users else (user or os.environ.get("USER"))
     try:
         if all_jobs:
-            jobs = service.list_jobs(user=resolved_user, status=status_filter)
+            jobs = service.list_jobs(user=resolved_user, all_users=all_users, status=status_filter)
             truncated = False
         else:
             jobs = service.list_jobs(
                 user=resolved_user,
+                all_users=all_users,
                 status=status_filter,
                 limit=_DEFAULT_STATUS_LIMIT + 1,
             )
@@ -306,114 +305,6 @@ def resources() -> None:
 
 
 @app.command()
-def dashboard_cmd(
-    refresh: float = typer.Option(
-        3.0, "--refresh", "-r", help="Seconds between screen refreshes."
-    ),
-) -> None:
-    """
-    Open the live TUI dashboard showing resources and job status.
-
-    Requires the qjob API server to be running.  Press Ctrl+C to exit.
-    """
-
-    dashboard.run(refresh_interval=refresh)
-
-
-# --------------------------------------------------------------------------------------
-# serve  (replaces Phase 1 daemon command)
-
-
-@app.command()
-def serve(
-    host: str = typer.Option(
-        "127.0.0.1", "--host", "-H", help="Network interface to bind."
-    ),
-    port: int = typer.Option(
-        8000, "--port", "-p", help="TCP port to listen on."
-    ),
-    log_level: str = typer.Option(
-        "info", "--log-level", help="Uvicorn log level: debug/info/warning/error."
-    ),
-    reload: bool = typer.Option(
-        False, "--reload", help="Enable auto-reload (development only)."
-    ),
-    workers: int = typer.Option(
-        1, "--workers", "-w", help="Number of uvicorn worker processes."
-    ),
-) -> None:
-    """
-    Start the qjob API server (FastAPI + uvicorn).
-
-    For multi-process deployments use --workers N and run 'qjob scheduler'
-    as a separate process.  Press Ctrl+C to stop.
-    """
-
-    if os.getuid() != 0:
-        typer.echo("Error: 'qjob serve' must be run as root.", err=True)
-        raise typer.Exit(code=1)
-
-    if reload and workers > 1:
-        typer.echo("Error: --reload and --workers cannot be combined.", err=True)
-        raise typer.Exit(code=1)
-
-    server.serve(
-        host=host,
-        port=port,
-        log_level=log_level,
-        reload=reload,
-        workers=workers,
-    )
-
-
-# --------------------------------------------------------------------------------------
-# scheduler
-
-
-@app.command()
-def scheduler(
-    poll_interval: float = typer.Option(
-        2.0, "--poll-interval", help="Seconds between scheduling ticks."
-    ),
-    max_workers: int = typer.Option(
-        64, "--max-workers", help="Maximum number of concurrently running jobs."
-    ),
-) -> None:
-    """
-    Start the standalone job scheduler process.
-
-    Only one scheduler may run at a time; a second invocation will exit
-    immediately with an error.  Press Ctrl+C to stop gracefully.
-    """
-
-    if os.getuid() != 0:
-        typer.echo("Error: 'qjob scheduler' must be run as root.", err=True)
-        raise typer.Exit(code=1)
-
-    try:
-        database.init_db()
-    except RuntimeError as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(code=1)
-
-    sched = _scheduler.Scheduler(
-        poll_interval=poll_interval,
-        max_workers=max_workers,
-        install_signal_handlers=True,
-    )
-
-    try:
-        asyncio.run(sched.start())
-    except RuntimeError as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(code=1)
-
-
-# --------------------------------------------------------------------------------------
-# dashboard
-
-
-@app.command()
 def dash(
     refresh: float = typer.Option(
         2.0, "--refresh", "-r", help="Seconds between screen refreshes."
@@ -431,46 +322,6 @@ def dash(
 
 # --------------------------------------------------------------------------------------
 # auth sub-commands
-
-
-@auth_app.command("init")
-def auth_init(
-    username: typing.Optional[str] = typer.Option(
-        None, "--username", "-u",
-        help="OS username to create a token for (default: current user).",
-    ),
-) -> None:
-    """
-    Create an API token via the API server (admin privileges required).
-
-    When --username is omitted the token is for the current OS user and is
-    saved to ~/.config/qjob/token automatically.  When --username names
-    another user the token is printed — distribute it to that user manually.
-    """
-
-    import getpass
-    import stat
-
-    current_user = getpass.getuser()
-    target = username or current_user
-
-    try:
-        token = service.create_token(target)
-    except ConnectionError as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(code=1)
-
-    if target == current_user:
-        token_path = service._TOKEN_PATH
-        token_path.parent.mkdir(parents=True, exist_ok=True)
-        token_path.write_text(token)
-        token_path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600
-        typer.echo(f"Token saved to {token_path}")
-    else:
-        typer.echo(f"Token for {target}: {token}")
-        typer.echo("Save this token — it will not be shown again.")
-
-    typer.echo(f"Authenticated as: {target}")
 
 
 # --------------------------------------------------------------------------------------
@@ -539,6 +390,46 @@ def admin_create_token(
     typer.echo(f"Token saved to {token_path}")
 
 
+@admin_app.command("init-token")
+def admin_init_token(
+    username: typing.Optional[str] = typer.Option(
+        None, "--username", "-u",
+        help="OS username to create a token for (default: current user).",
+    ),
+) -> None:
+    """
+    Create an API token via the API server (admin privileges required).
+
+    When --username is omitted the token is for the current OS user and is
+    saved to ~/.config/qjob/token automatically.  When --username names
+    another user the token is printed — distribute it to that user manually.
+    """
+
+    import getpass
+    import stat
+
+    current_user = getpass.getuser()
+    target = username or current_user
+
+    try:
+        token = service.create_token(target)
+    except ConnectionError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    if target == current_user:
+        token_path = service._TOKEN_PATH
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        token_path.write_text(token)
+        token_path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600
+        typer.echo(f"Token saved to {token_path}")
+    else:
+        typer.echo(f"Token for {target}: {token}")
+        typer.echo("Save this token — it will not be shown again.")
+
+    typer.echo(f"Authenticated as: {target}")
+
+
 @admin_app.command("set-resources")
 def admin_set_resources(
     cpus: typing.Optional[int] = typer.Option(
@@ -599,7 +490,7 @@ def admin_list_jobs(
     """List all jobs from all users (admin view)."""
 
     try:
-        jobs = service.list_jobs(user=None, status=status_filter)
+        jobs = service.list_jobs(user=None, all_users=True, status=status_filter)
     except ValueError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1)
@@ -612,6 +503,87 @@ def admin_list_jobs(
         return
 
     _print_job_table(jobs)
+
+
+@admin_app.command("serve")
+def admin_serve(
+    host: str = typer.Option(
+        "127.0.0.1", "--host", "-H", help="Network interface to bind."
+    ),
+    port: int = typer.Option(
+        8000, "--port", "-p", help="TCP port to listen on."
+    ),
+    log_level: str = typer.Option(
+        "info", "--log-level", help="Uvicorn log level: debug/info/warning/error."
+    ),
+    reload: bool = typer.Option(
+        False, "--reload", help="Enable auto-reload (development only)."
+    ),
+    workers: int = typer.Option(
+        1, "--workers", "-w", help="Number of uvicorn worker processes."
+    ),
+) -> None:
+    """
+    Start the qjob API server (FastAPI + uvicorn).
+
+    For multi-process deployments use --workers N and run 'qjob admin scheduler'
+    as a separate process.  Press Ctrl+C to stop.
+    """
+
+    if os.getuid() != 0:
+        typer.echo("Error: 'qjob admin serve' must be run as root.", err=True)
+        raise typer.Exit(code=1)
+
+    if reload and workers > 1:
+        typer.echo("Error: --reload and --workers cannot be combined.", err=True)
+        raise typer.Exit(code=1)
+
+    server.serve(
+        host=host,
+        port=port,
+        log_level=log_level,
+        reload=reload,
+        workers=workers,
+    )
+
+
+@admin_app.command("scheduler")
+def admin_scheduler(
+    poll_interval: float = typer.Option(
+        2.0, "--poll-interval", help="Seconds between scheduling ticks."
+    ),
+    max_workers: int = typer.Option(
+        64, "--max-workers", help="Maximum number of concurrently running jobs."
+    ),
+) -> None:
+    """
+    Start the standalone job scheduler process.
+
+    Only one scheduler may run at a time; a second invocation will exit
+    immediately with an error.  Press Ctrl+C to stop gracefully.
+    """
+
+    if os.getuid() != 0:
+        typer.echo("Error: 'qjob admin scheduler' must be run as root.", err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        database.init_db()
+    except RuntimeError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    sched = _scheduler.Scheduler(
+        poll_interval=poll_interval,
+        max_workers=max_workers,
+        install_signal_handlers=True,
+    )
+
+    try:
+        asyncio.run(sched.start())
+    except RuntimeError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1)
 
 
 # --------------------------------------------------------------------------------------
