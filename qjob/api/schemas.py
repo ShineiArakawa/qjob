@@ -16,14 +16,11 @@ class JobSubmitRequest(pydantic.BaseModel):
     ----------
     script_path : str
         Absolute path to the shell script on the server.
-    user : str | None
-        Submitting username.  When None the server resolves it from the OS.
     workdir : str | None
         Working directory to use when running the script.
     """
 
     script_path: str
-    user:        str | None = None
     workdir:     str | None = None
 
 
@@ -215,3 +212,36 @@ class ErrorResponse(pydantic.BaseModel):
     """
 
     detail: str
+
+
+# --------------------------------------------------------------------------------------
+# Auth schemas
+
+
+class TokenCreateRequest(pydantic.BaseModel):
+    """
+    Request body for POST /auth/token.
+
+    Attributes
+    ----------
+    username : str
+        OS username to associate with the new token.
+    """
+
+    username: str
+
+
+class TokenResponse(pydantic.BaseModel):
+    """
+    Response for POST /auth/token.
+
+    Attributes
+    ----------
+    token : str
+        The raw token.  Shown once — store it securely.
+    username : str
+        The username associated with this token.
+    """
+
+    token:    str
+    username: str

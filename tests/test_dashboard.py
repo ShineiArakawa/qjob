@@ -69,6 +69,7 @@ def _make_resource_info(**kwargs) -> service.ResourceInfo:
         total_cpus=32,
         total_gpus=4,
         total_mem_mb=131072,
+        max_walltime_sec=None,
         used_cpus=8,
         used_gpus=2,
         used_mem_mb=32768,

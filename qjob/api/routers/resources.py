@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fastapi
 
+import qjob.api.auth as auth
 import qjob.api.crud as crud
 import qjob.api.schemas as schemas
 
@@ -20,7 +21,9 @@ router = fastapi.APIRouter(prefix="/resources", tags=["resources"])
     response_model=schemas.ResourceResponse,
     summary="Get resource availability",
 )
-def get_resources() -> schemas.ResourceResponse:
+def get_resources(
+    current_user: str = fastapi.Depends(auth.get_current_user),
+) -> schemas.ResourceResponse:
     """
     Return the current resource configuration and usage summary.
 
@@ -48,7 +51,10 @@ def get_resources() -> schemas.ResourceResponse:
     response_model=schemas.ResourceResponse,
     summary="Update resource limits (admin)",
 )
-def update_resources(body: schemas.ResourceUpdateRequest) -> schemas.ResourceResponse:
+def update_resources(
+    body:         schemas.ResourceUpdateRequest,
+    current_user: str = fastapi.Depends(auth.require_admin),
+) -> schemas.ResourceResponse:
     """
     Update the available resource limits.
 

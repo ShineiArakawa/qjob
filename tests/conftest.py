@@ -1,7 +1,9 @@
 # tests/conftest.py
 
 import datetime
+import hashlib
 import os
+import secrets
 
 import pytest
 import sqlalchemy
@@ -61,11 +63,39 @@ def _clear_data() -> None:
     """Delete test data while preserving the migrated schema."""
 
     with database.get_engine().begin() as connection:
+        connection.execute(sqlalchemy.delete(models.ApiToken))
         connection.execute(sqlalchemy.delete(models.Job))
         connection.execute(sqlalchemy.delete(models.Resource))
 
     with database.get_session() as session:
         session.add(models.Resource(id=1))
+
+
+def _insert_token(username: str) -> str:
+    """Insert an API token for *username* directly into the DB and return the raw token."""
+    token = secrets.token_hex(32)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    with database.get_session() as session:
+        session.add(models.ApiToken(username=username, token_hash=token_hash))
+    return token
+
+
+@pytest.fixture
+def alice_token():
+    """Raw API token for 'alice'."""
+    return _insert_token("alice")
+
+
+@pytest.fixture
+def bob_token():
+    """Raw API token for 'bob'."""
+    return _insert_token("bob")
+
+
+@pytest.fixture
+def root_token():
+    """Raw API token for 'root' (admin via QJOB_ADMIN_USERS default)."""
+    return _insert_token("root")
 
 
 def as_utc(dt: datetime.datetime) -> datetime.datetime:

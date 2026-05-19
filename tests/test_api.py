@@ -41,25 +41,41 @@ def app():
 
 
 @pytest.fixture
-def client(app):
+def client(app, alice_token):
     """
-    Return a synchronous TestClient for the FastAPI application.
-
-    The ``with`` block triggers the lifespan context manager, which starts
-    (and later stops) the scheduler.
+    Return a synchronous TestClient authenticated as 'alice'.
 
     Parameters
     ----------
     app : fastapi.FastAPI
         The application under test.
+    alice_token : str
+        Raw API token for alice (injected from conftest fixture).
 
     Yields
     ------
     fastapi.testclient.TestClient
-        A configured test client.
+        A configured test client with alice's Authorization header.
     """
 
-    with TestClient(app) as tc:
+    headers = {"Authorization": f"Bearer {alice_token}"}
+    with TestClient(app, headers=headers) as tc:
+        yield tc
+
+
+@pytest.fixture
+def admin_client(app, root_token):
+    """
+    Return a synchronous TestClient authenticated as 'root' (admin).
+
+    Yields
+    ------
+    fastapi.testclient.TestClient
+        A configured test client with root's Authorization header.
+    """
+
+    headers = {"Authorization": f"Bearer {root_token}"}
+    with TestClient(app, headers=headers) as tc:
         yield tc
 
 
@@ -154,9 +170,7 @@ class TestSubmitJob:
             #QJOB --name my-job --cpus 4 --gpus 1
             python x.py
         """)
-        response = client.post(
-            "/jobs", json={"script_path": str(script), "user": "alice"}
-        )
+        response = client.post("/jobs", json={"script_path": str(script)})
         data = response.json()
         assert data["name"] == "my-job"
         assert data["req_cpus"] == 4
@@ -170,11 +184,7 @@ class TestSubmitJob:
 
         response = client.post(
             "/jobs",
-            json={
-                "script_path": str(script),
-                "user": "alice",
-                "workdir": str(workdir),
-            },
+            json={"script_path": str(script), "workdir": str(workdir)},
         )
 
         assert response.status_code == 201
@@ -183,9 +193,7 @@ class TestSubmitJob:
     def test_default_workdir_is_script_parent(self, client, make_script):
         script = make_script("#!/bin/bash\npython x.py\n")
 
-        response = client.post(
-            "/jobs", json={"script_path": str(script), "user": "alice"}
-        )
+        response = client.post("/jobs", json={"script_path": str(script)})
 
         assert response.status_code == 201
         assert response.json()["workdir"] == str(script.parent)
@@ -220,7 +228,7 @@ class TestListJobs:
 
     def test_returns_submitted_job(self, client, make_script):
         script = make_script("#!/bin/bash\npython x.py\n")
-        client.post("/jobs", json={"script_path": str(script), "user": "alice"})
+        client.post("/jobs", json={"script_path": str(script)})
         data = client.get("/jobs").json()
         assert data["total"] == 1
 
@@ -318,14 +326,14 @@ class TestCancelJob:
 
     def test_cancels_queued_job(self, client):
         job = _persist_job(user="alice", status=models.JobStatus.QUEUED)
-        response = client.delete(f"/jobs/{job.id}", params={"user": "alice"})
+        response = client.delete(f"/jobs/{job.id}")
         assert response.status_code == 200
         assert response.json()["status"] == "cancelled"
 
     def test_cancels_running_job_without_pid(self, client):
         # No PID means no live process — cancel completes immediately.
         job = _persist_job(user="alice", status=models.JobStatus.RUNNING)
-        response = client.delete(f"/jobs/{job.id}", params={"user": "alice"})
+        response = client.delete(f"/jobs/{job.id}")
         assert response.status_code == 200
         assert response.json()["status"] == "cancelled"
 
@@ -335,45 +343,43 @@ class TestCancelJob:
         with database.get_session() as session:
             stored = session.get(models.Job, job.id)
             stored.pid = 99999999  # Non-existent PID; ProcessLookupError is silently caught.
-        response = client.delete(f"/jobs/{job.id}", params={"user": "alice"})
+        response = client.delete(f"/jobs/{job.id}")
         assert response.status_code == 200
         assert response.json()["status"] == "cancelling"
 
     def test_returns_409_for_cancelling_job(self, client):
         job = _persist_job(user="alice", status=models.JobStatus.CANCELLING)
-        response = client.delete(f"/jobs/{job.id}", params={"user": "alice"})
+        response = client.delete(f"/jobs/{job.id}")
         assert response.status_code == 409
 
     def test_returns_404_for_unknown_id(self, client):
-        response = client.delete(
-            "/jobs/00000000-0000-0000-0000-000000000000",
-            params={"user": "alice"},
-        )
+        response = client.delete("/jobs/00000000-0000-0000-0000-000000000000")
         assert response.status_code == 404
 
-    def test_returns_403_for_wrong_user(self, client):
+    def test_returns_403_for_wrong_user(self, client, bob_token):
         job = _persist_job(user="alice")
-        response = client.delete(f"/jobs/{job.id}", params={"user": "bob"})
+        bob_headers = {"Authorization": f"Bearer {bob_token}"}
+        response = client.delete(f"/jobs/{job.id}", headers=bob_headers)
         assert response.status_code == 403
 
-    def test_root_can_cancel_any_job(self, client):
+    def test_root_can_cancel_any_job(self, admin_client):
         job = _persist_job(user="alice")
-        response = client.delete(f"/jobs/{job.id}", params={"user": "root"})
+        response = admin_client.delete(f"/jobs/{job.id}")
         assert response.status_code == 200
 
     def test_returns_409_for_done_job(self, client):
         job = _persist_job(user="alice", status=models.JobStatus.DONE)
-        response = client.delete(f"/jobs/{job.id}", params={"user": "alice"})
+        response = client.delete(f"/jobs/{job.id}")
         assert response.status_code == 409
 
     def test_returns_409_for_already_cancelled(self, client):
         job = _persist_job(user="alice", status=models.JobStatus.CANCELLED)
-        response = client.delete(f"/jobs/{job.id}", params={"user": "alice"})
+        response = client.delete(f"/jobs/{job.id}")
         assert response.status_code == 409
 
     def test_persists_cancelled_status(self, client):
         job = _persist_job(user="alice")
-        client.delete(f"/jobs/{job.id}", params={"user": "alice"})
+        client.delete(f"/jobs/{job.id}")
         with database.get_session() as session:
             stored = session.get(models.Job, job.id)
             assert stored.status == models.JobStatus.CANCELLED
@@ -488,48 +494,52 @@ class TestGetResources:
 
 
 class TestUpdateResources:
-    """PUT /resources updates resource limits."""
+    """PUT /resources updates resource limits (admin only)."""
 
-    def test_returns_200(self, client):
-        response = client.put("/resources", json={"total_cpus": 16})
+    def test_returns_200(self, admin_client):
+        response = admin_client.put("/resources", json={"total_cpus": 16})
         assert response.status_code == 200
 
-    def test_updates_cpus(self, client):
-        client.put("/resources", json={"total_cpus": 32})
-        data = client.get("/resources").json()
+    def test_non_admin_returns_403(self, client):
+        response = client.put("/resources", json={"total_cpus": 16})
+        assert response.status_code == 403
+
+    def test_updates_cpus(self, admin_client):
+        admin_client.put("/resources", json={"total_cpus": 32})
+        data = admin_client.get("/resources").json()
         assert data["total_cpus"] == 32
 
-    def test_updates_gpus(self, client):
-        client.put("/resources", json={"total_gpus": 4})
-        data = client.get("/resources").json()
+    def test_updates_gpus(self, admin_client):
+        admin_client.put("/resources", json={"total_gpus": 4})
+        data = admin_client.get("/resources").json()
         assert data["total_gpus"] == 4
 
-    def test_updates_mem(self, client):
-        client.put("/resources", json={"total_mem_mb": 65536})
-        data = client.get("/resources").json()
+    def test_updates_mem(self, admin_client):
+        admin_client.put("/resources", json={"total_mem_mb": 65536})
+        data = admin_client.get("/resources").json()
         assert data["total_mem_mb"] == 65536
 
-    def test_empty_body_returns_422(self, client):
+    def test_empty_body_returns_422(self, admin_client):
         # Pydantic model_validator rejects all-None bodies.
-        response = client.put("/resources", json={})
+        response = admin_client.put("/resources", json={})
         assert response.status_code == 422
 
-    def test_zero_cpus_returns_422(self, client):
-        response = client.put("/resources", json={"total_cpus": 0})
+    def test_zero_cpus_returns_422(self, admin_client):
+        response = admin_client.put("/resources", json={"total_cpus": 0})
         assert response.status_code == 422
 
-    def test_negative_gpus_returns_422(self, client):
-        response = client.put("/resources", json={"total_gpus": -1})
+    def test_negative_gpus_returns_422(self, admin_client):
+        response = admin_client.put("/resources", json={"total_gpus": -1})
         assert response.status_code == 422
 
-    def test_zero_mem_returns_422(self, client):
-        response = client.put("/resources", json={"total_mem_mb": 0})
+    def test_zero_mem_returns_422(self, admin_client):
+        response = admin_client.put("/resources", json={"total_mem_mb": 0})
         assert response.status_code == 422
 
-    def test_partial_update_preserves_other_fields(self, client):
-        client.put("/resources", json={"total_cpus": 8, "total_gpus": 2})
-        client.put("/resources", json={"total_cpus": 16})
-        data = client.get("/resources").json()
+    def test_partial_update_preserves_other_fields(self, admin_client):
+        admin_client.put("/resources", json={"total_cpus": 8, "total_gpus": 2})
+        admin_client.put("/resources", json={"total_cpus": 16})
+        data = admin_client.get("/resources").json()
         assert data["total_cpus"] == 16
         assert data["total_gpus"] == 2
 
@@ -554,14 +564,19 @@ class TestServiceHttpClient:
     """service.py async functions correctly parse API responses."""
 
     @pytest.fixture(autouse=True)
-    def patch_async_client(self, client):
+    def patch_async_client(self, client, alice_token):
         """
         Replace service._async_client with a factory backed by ASGITransport.
+
+        The mock client includes alice's Bearer token so all service calls are
+        authenticated as alice.
 
         Parameters
         ----------
         client : starlette.testclient.TestClient
             The test client whose app is used as the ASGI transport target.
+        alice_token : str
+            Raw API token for alice.
 
         Yields
         ------
@@ -571,11 +586,13 @@ class TestServiceHttpClient:
         import httpx
 
         original = service._async_client
+        auth_headers = {"Authorization": f"Bearer {alice_token}"}
 
         def _mock():
             return httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=client.app),
                 base_url="http://testserver",
+                headers=auth_headers,
             )
 
         service._async_client = _mock
@@ -584,7 +601,7 @@ class TestServiceHttpClient:
 
     def test_list_jobs_parses_response(self, client, make_script):
         script = make_script("#!/bin/bash\npython x.py\n")
-        client.post("/jobs", json={"script_path": str(script), "user": "alice"})
+        client.post("/jobs", json={"script_path": str(script)})
 
         jobs = service.list_jobs(user="alice")
         assert len(jobs) == 1
@@ -596,9 +613,10 @@ class TestServiceHttpClient:
         assert result is None
 
     def test_cancel_job_raises_permission_error(self):
-        job = _persist_job(user="alice")
+        # alice (authenticated) tries to cancel a job owned by bob — expects 403.
+        job = _persist_job(user="bob")
         with pytest.raises(PermissionError):
-            service.cancel_job(job.id, user="bob")
+            service.cancel_job(job.id)
 
     def test_get_resources_returns_resource_info(self):
         info = service.get_resources()

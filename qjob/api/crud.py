@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
-import getpass
 import json
 import os
 import pathlib
@@ -145,7 +144,7 @@ class JobListPage:
 
 def submit_job(
     script_path: str,
-    user:        str | None = None,
+    user:        str,
     workdir:     str | None = None,
 ) -> JobInfo:
     """
@@ -155,8 +154,8 @@ def submit_job(
     ----------
     script_path : str
         Path to the shell script containing ``#QJOB`` directives.
-    user : str | None
-        Username of the submitting user.  Defaults to the OS login name.
+    user : str
+        Authenticated username of the submitting user.
     workdir : str | None
         Directory used as the subprocess working directory. Defaults to the
         submitted script's parent directory.
@@ -174,7 +173,7 @@ def submit_job(
         If any ``#QJOB`` directive is malformed.
     """
 
-    resolved_user = user or getpass.getuser()
+    resolved_user = user
     directives = parser.parse_script(pathlib.Path(script_path))
     if directives.name is None:
         directives.name = coolname.generate_slug(2)
@@ -292,18 +291,20 @@ def list_jobs(
         )
 
 
-def cancel_job(job_id: str, user: str | None = None) -> JobInfo | None:
+def cancel_job(job_id: str, user: str, admin: bool = False) -> JobInfo | None:
     """
     Request cancellation of a queued or running job.
 
-    Only the submitting user (or root) may cancel a job.
+    Only the submitting user (or an admin) may cancel a job.
 
     Parameters
     ----------
     job_id : str
         UUID of the job to cancel.
-    user : str | None
-        The requesting user.  Defaults to the OS login name.
+    user : str
+        Authenticated username of the requesting user.
+    admin : bool
+        When True, ownership check is skipped (admin cancellation).
 
     Returns
     -------
@@ -313,19 +314,19 @@ def cancel_job(job_id: str, user: str | None = None) -> JobInfo | None:
     Raises
     ------
     PermissionError
-        If *user* is not the job owner and not root.
+        If *user* is not the job owner and *admin* is False.
     ValueError
         If the job is already in a terminal state.
     """
 
-    resolved_user = user or getpass.getuser()
+    resolved_user = user
 
     with database.get_session() as session:
         job = session.get(models.Job, job_id)
         if job is None:
             return None
 
-        if job.user != resolved_user and resolved_user != "root":
+        if not admin and job.user != resolved_user:
             raise PermissionError(
                 f"User {resolved_user!r} is not allowed to cancel "
                 f"job {job_id!r} owned by {job.user!r}."

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import getpass
 import json
 import os
 import pathlib
@@ -14,6 +15,9 @@ import qjob.core.models as models
 import qjob.core.runner as runner
 import qjob.core.scheduler as scheduler
 from tests.conftest import as_utc
+
+# Use the real OS user so preexec_fn can resolve it via pwd.getpwnam().
+_REAL_USER = getpass.getuser()
 
 # --------------------------------------------------------------------------------------
 # Helpers
@@ -29,7 +33,7 @@ def _make_job(
     """Return a persisted QUEUED job."""
 
     job = models.Job(
-        user="alice",
+        user=_REAL_USER,
         script_path=script_path,
         status=models.JobStatus.QUEUED,
         req_cpus=req_cpus,
@@ -92,7 +96,7 @@ class TestBuildEnv:
     def test_qjob_user_set(self):
         job = _make_job()
         env = runner._build_env(job)
-        assert env["QJOB_USER"] == "alice"
+        assert env["QJOB_USER"] == _REAL_USER
 
     def test_inherits_existing_env(self, monkeypatch):
         monkeypatch.setenv("MY_CUSTOM_VAR", "hello")

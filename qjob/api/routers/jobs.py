@@ -4,6 +4,7 @@ import typing
 
 import fastapi
 
+import qjob.api.auth as auth
 import qjob.api.crud as crud
 import qjob.api.schemas as schemas
 
@@ -23,14 +24,19 @@ router = fastapi.APIRouter(prefix="/jobs", tags=["jobs"])
     status_code=201,
     summary="Submit a new job",
 )
-def submit_job(body: schemas.JobSubmitRequest) -> schemas.JobResponse:
+def submit_job(
+    body:         schemas.JobSubmitRequest,
+    current_user: str = fastapi.Depends(auth.get_current_user),
+) -> schemas.JobResponse:
     """
     Parse a shell script and enqueue it as a new job.
 
     Parameters
     ----------
     body : schemas.JobSubmitRequest
-        Request body containing the script path and optional username.
+        Request body containing the script path and optional workdir.
+    current_user : str
+        Authenticated username (injected by auth dependency).
 
     Returns
     -------
@@ -47,7 +53,7 @@ def submit_job(body: schemas.JobSubmitRequest) -> schemas.JobResponse:
     try:
         info = crud.submit_job(
             script_path=body.script_path,
-            user=body.user,
+            user=current_user,
             workdir=body.workdir,
         )
     except FileNotFoundError as exc:
@@ -72,44 +78,44 @@ def submit_job(body: schemas.JobSubmitRequest) -> schemas.JobResponse:
     summary="List jobs",
 )
 def list_jobs(
-    user:   typing.Optional[str] = fastapi.Query(None, description="Filter by username."),
-    status: typing.Optional[str] = fastapi.Query(None, description="Filter by status."),
-    limit:  int = fastapi.Query(
+    user:         typing.Optional[str] = fastapi.Query(None, description="Filter by username (admin only)."),
+    status:       typing.Optional[str] = fastapi.Query(None, description="Filter by status."),
+    limit:        int = fastapi.Query(
         crud.DEFAULT_JOB_LIST_LIMIT,
         ge=1,
         le=crud.MAX_JOB_LIST_LIMIT,
         description="Maximum number of jobs to return.",
     ),
-    offset: int = fastapi.Query(
-        0,
-        ge=0,
-        description="Number of matching jobs to skip.",
-    ),
+    offset:       int = fastapi.Query(0, ge=0, description="Number of matching jobs to skip."),
+    current_user: str = fastapi.Depends(auth.get_current_user),
 ) -> schemas.JobListResponse:
     """
     Return jobs optionally filtered by user and/or status.
 
+    Non-admin users always see only their own jobs regardless of the *user*
+    query parameter.  Admins may filter by any user or omit *user* to see all.
+
     Parameters
     ----------
     user : str | None
-        When given, only jobs submitted by this user are returned.
+        Username filter.  Ignored for non-admin callers.
     status : str | None
         When given, only jobs in this status are returned.
     limit : int
         Maximum number of jobs to return.
     offset : int
         Number of matching jobs to skip.
+    current_user : str
+        Authenticated username (injected by auth dependency).
 
     Returns
     -------
     schemas.JobListResponse
         Matching jobs ordered by submission time descending.
-
-    Raises
-    ------
-    fastapi.HTTPException
-        400 if *status* is not a valid value.
     """
+
+    if not auth.is_admin(current_user):
+        user = current_user
 
     try:
         page = crud.list_jobs(user=user, status=status, limit=limit, offset=offset)
@@ -133,14 +139,19 @@ def list_jobs(
     response_model=schemas.JobResponse,
     summary="Get job details",
 )
-def get_job(job_id: str) -> schemas.JobResponse:
+def get_job(
+    job_id:       str,
+    current_user: str = fastapi.Depends(auth.get_current_user),
+) -> schemas.JobResponse:
     """
     Return details of a single job.
 
     Parameters
     ----------
     job_id : str
-        UUID of the job to look up.
+        ID of the job to look up.
+    current_user : str
+        Authenticated username (injected by auth dependency).
 
     Returns
     -------
@@ -151,6 +162,7 @@ def get_job(job_id: str) -> schemas.JobResponse:
     ------
     fastapi.HTTPException
         404 if no job with *job_id* exists.
+        403 if a non-admin user requests a job that is not theirs.
     """
 
     info = crud.get_job(job_id)
@@ -158,6 +170,9 @@ def get_job(job_id: str) -> schemas.JobResponse:
         raise fastapi.HTTPException(
             status_code=404, detail=f"Job {job_id!r} not found."
         )
+
+    if not auth.is_admin(current_user) and info.user != current_user:
+        raise fastapi.HTTPException(status_code=403, detail="Access denied.")
 
     return _info_to_response(info)
 
@@ -172,20 +187,20 @@ def get_job(job_id: str) -> schemas.JobResponse:
     summary="Cancel a job",
 )
 def cancel_job(
-    job_id: str,
-    user:   typing.Optional[str] = fastapi.Query(
-        None, description="Requesting username."
-    ),
+    job_id:       str,
+    current_user: str = fastapi.Depends(auth.get_current_user),
 ) -> schemas.JobResponse:
     """
     Cancel a queued or running job.
 
+    Admins may cancel any job.  Regular users may only cancel their own jobs.
+
     Parameters
     ----------
     job_id : str
-        UUID of the job to cancel.
-    user : str | None
-        The requesting user.  Defaults to the OS login name.
+        ID of the job to cancel.
+    current_user : str
+        Authenticated username (injected by auth dependency).
 
     Returns
     -------
@@ -201,7 +216,7 @@ def cancel_job(
     """
 
     try:
-        info = crud.cancel_job(job_id, user=user)
+        info = crud.cancel_job(job_id, user=current_user, admin=auth.is_admin(current_user))
     except PermissionError as exc:
         raise fastapi.HTTPException(status_code=403, detail=str(exc))
     except ValueError as exc:
@@ -225,26 +240,31 @@ def cancel_job(
     summary="Get job log",
 )
 def get_log(
-    job_id: str,
-    stream: str = fastapi.Query("stdout", description="Log stream: stdout or stderr."),
-    max_bytes: int = fastapi.Query(
+    job_id:       str,
+    stream:       str = fastapi.Query("stdout", description="Log stream: stdout or stderr."),
+    max_bytes:    int = fastapi.Query(
         crud.DEFAULT_LOG_MAX_BYTES,
         ge=1,
         le=crud.MAX_LOG_MAX_BYTES,
         description="Maximum bytes to return from the end of the log.",
     ),
+    current_user: str = fastapi.Depends(auth.get_current_user),
 ) -> schemas.JobLogResponse:
     """
     Return the log content for a job.
 
+    Non-admin users may only retrieve logs for their own jobs.
+
     Parameters
     ----------
     job_id : str
-        UUID of the job.
+        ID of the job.
     stream : str
         Which log stream to read: ``"stdout"`` or ``"stderr"``.
     max_bytes : int
         Maximum bytes to return from the end of the log.
+    current_user : str
+        Authenticated username (injected by auth dependency).
 
     Returns
     -------
@@ -255,7 +275,16 @@ def get_log(
     ------
     fastapi.HTTPException
         400 if *stream* is not ``"stdout"`` or ``"stderr"``.
+        403 if a non-admin user requests a log for another user's job.
+        404 if the job does not exist.
     """
+
+    info = crud.get_job(job_id)
+    if info is None:
+        raise fastapi.HTTPException(status_code=404, detail=f"Job {job_id!r} not found.")
+
+    if not auth.is_admin(current_user) and info.user != current_user:
+        raise fastapi.HTTPException(status_code=403, detail="Access denied.")
 
     try:
         content = crud.get_log(job_id, stream=stream, max_bytes=max_bytes)
@@ -270,20 +299,6 @@ def get_log(
 
 
 def _info_to_response(info: crud.JobInfo) -> schemas.JobResponse:
-    """
-    Convert a JobInfo data class to a JobResponse schema.
-
-    Parameters
-    ----------
-    info : crud.JobInfo
-        The service-layer data object.
-
-    Returns
-    -------
-    schemas.JobResponse
-        The API response model.
-    """
-
     return schemas.JobResponse(
         id=info.id,
         user=info.user,

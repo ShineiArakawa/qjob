@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import datetime
-import getpass
 import os
+import pathlib
 import typing
 
 import httpx
@@ -16,6 +16,7 @@ import qjob.core.parser as parser
 
 _DEFAULT_API_URL: str = "http://127.0.0.1:8000"
 _DEFAULT_TIMEOUT: float = 10.0
+_TOKEN_PATH: pathlib.Path = pathlib.Path.home() / ".config" / "qjob" / "token"
 
 
 def _api_url() -> str:
@@ -23,9 +24,29 @@ def _api_url() -> str:
     return os.environ.get("QJOB_API_URL", _DEFAULT_API_URL).rstrip("/")
 
 
+def _load_token() -> str:
+    """Read the API token from ~/.config/qjob/token."""
+    token_path = pathlib.Path(os.environ.get("QJOB_TOKEN_PATH", str(_TOKEN_PATH)))
+    try:
+        return token_path.read_text().strip()
+    except FileNotFoundError:
+        raise ConnectionError(
+            f"No API token found at {token_path}. Run 'qjob auth init' first."
+        )
+
+
+def _auth_headers() -> dict[str, str]:
+    """Return Authorization header with the stored token."""
+    return {"Authorization": f"Bearer {_load_token()}"}
+
+
 def _async_client() -> httpx.AsyncClient:
-    """Return a configured async httpx client."""
-    return httpx.AsyncClient(base_url=_api_url(), timeout=_DEFAULT_TIMEOUT)
+    """Return a configured async httpx client with auth headers."""
+    return httpx.AsyncClient(
+        base_url=_api_url(),
+        timeout=_DEFAULT_TIMEOUT,
+        headers=_auth_headers(),
+    )
 
 
 def _run(coroutine: typing.Coroutine) -> typing.Any:
@@ -143,7 +164,7 @@ class ResourceInfo:
 # This keeps the CLI interface synchronous while using AsyncClient internally.
 
 
-def submit_job(script_path: str, user: str | None = None) -> JobInfo:
+def submit_job(script_path: str) -> JobInfo:
     """
     Submit a shell script to the job queue via the API.
 
@@ -151,8 +172,6 @@ def submit_job(script_path: str, user: str | None = None) -> JobInfo:
     ----------
     script_path : str
         Path to the shell script containing ``#QJOB`` directives.
-    user : str | None
-        Username of the submitting user.  Defaults to the OS login name.
 
     Returns
     -------
@@ -171,7 +190,7 @@ def submit_job(script_path: str, user: str | None = None) -> JobInfo:
 
     # Validate locally before making the network round trip.
     parser.parse_script(script_path)
-    return _run(_async_submit_job(script_path, user))
+    return _run(_async_submit_job(script_path))
 
 
 def get_job(job_id: str) -> JobInfo | None:
@@ -227,7 +246,7 @@ def list_jobs(
     return _run(_async_list_jobs(user, status, limit, offset))
 
 
-def cancel_job(job_id: str, user: str | None = None) -> JobInfo | None:
+def cancel_job(job_id: str) -> JobInfo | None:
     """
     Request cancellation of a queued or running job.
 
@@ -235,8 +254,6 @@ def cancel_job(job_id: str, user: str | None = None) -> JobInfo | None:
     ----------
     job_id : str
         UUID of the job to cancel.
-    user : str | None
-        The requesting user.  Defaults to the OS login name.
 
     Returns
     -------
@@ -246,12 +263,12 @@ def cancel_job(job_id: str, user: str | None = None) -> JobInfo | None:
     Raises
     ------
     PermissionError
-        If the user is not the job owner and not root.
+        If the authenticated user does not own the job and is not an admin.
     ValueError
         If the job is already in a terminal state.
     """
 
-    return _run(_async_cancel_job(job_id, user))
+    return _run(_async_cancel_job(job_id))
 
 
 def get_log(job_id: str, stream: str = "stdout") -> str:
@@ -302,6 +319,24 @@ def get_resources() -> ResourceInfo:
     return _run(_async_get_resources())
 
 
+def create_token(username: str) -> str:
+    """
+    Create an API token for *username* and return the raw token string.
+
+    Parameters
+    ----------
+    username : str
+        OS username to associate with the new token.
+
+    Returns
+    -------
+    str
+        The raw token.  Should be saved to ``~/.config/qjob/token``.
+    """
+
+    return _run(_async_create_token(username))
+
+
 def set_resources(
     total_cpus:       int | None = None,
     total_gpus:       int | None = None,
@@ -342,22 +377,14 @@ def set_resources(
 # Async implementations
 
 
-async def _async_submit_job(
-    script_path: str,
-    user: str | None,
-) -> JobInfo:
+async def _async_submit_job(script_path: str) -> JobInfo:
     """Async implementation of submit_job."""
 
-    resolved_user = user or getpass.getuser()
     workdir = os.getcwd()
     async with _async_client() as client:
         response = await client.post(
             "/jobs",
-            json={
-                "script_path": script_path,
-                "user": resolved_user,
-                "workdir": workdir,
-            },
+            json={"script_path": script_path, "workdir": workdir},
         )
         _raise_for_status(response)
     return _parse_job(response.json())
@@ -436,17 +463,11 @@ async def _fetch_jobs_page(
     return response.json()
 
 
-async def _async_cancel_job(
-    job_id: str,
-    user:   str | None,
-) -> JobInfo | None:
+async def _async_cancel_job(job_id: str) -> JobInfo | None:
     """Async implementation of cancel_job."""
 
-    resolved_user = user or getpass.getuser()
     async with _async_client() as client:
-        response = await client.delete(
-            f"/jobs/{job_id}", params={"user": resolved_user}
-        )
+        response = await client.delete(f"/jobs/{job_id}")
     if response.status_code == 404:
         return None
     if response.status_code == 403:
@@ -455,6 +476,15 @@ async def _async_cancel_job(
         raise ValueError(response.json().get("detail", "Job is in a terminal state."))
     _raise_for_status(response)
     return _parse_job(response.json())
+
+
+async def _async_create_token(username: str) -> str:
+    """Async implementation of create_token. Does not use auth headers."""
+
+    async with httpx.AsyncClient(base_url=_api_url(), timeout=_DEFAULT_TIMEOUT) as client:
+        response = await client.post("/auth/token", json={"username": username})
+    _raise_for_status(response)
+    return response.json()["token"]
 
 
 async def _async_get_log(job_id: str, stream: str) -> str:

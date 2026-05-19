@@ -129,15 +129,15 @@ class Job(Base):
 
     # -- Timestamps ---------------------------------------------------------------------
     submitted_at: sqlalchemy.orm.Mapped[datetime.datetime] = sqlalchemy.orm.mapped_column(
-        sqlalchemy.DateTime,
+        sqlalchemy.DateTime(timezone=True),
         nullable=False,
         default=lambda: datetime.datetime.now(datetime.timezone.utc),
     )
     started_at: sqlalchemy.orm.Mapped[datetime.datetime | None] = sqlalchemy.orm.mapped_column(
-        sqlalchemy.DateTime, nullable=True
+        sqlalchemy.DateTime(timezone=True), nullable=True
     )
     finished_at: sqlalchemy.orm.Mapped[datetime.datetime | None] = sqlalchemy.orm.mapped_column(
-        sqlalchemy.DateTime, nullable=True
+        sqlalchemy.DateTime(timezone=True), nullable=True
     )
 
     # -- Runtime info -------------------------------------------------------------------
@@ -275,7 +275,7 @@ class Resource(Base):
         sqlalchemy.Integer, nullable=False, default=0
     )
     updated_at: sqlalchemy.orm.Mapped[datetime.datetime] = sqlalchemy.orm.mapped_column(
-        sqlalchemy.DateTime,
+        sqlalchemy.DateTime(timezone=True),
         nullable=False,
         default=lambda: datetime.datetime.now(datetime.timezone.utc),
         onupdate=lambda: datetime.datetime.now(datetime.timezone.utc),
@@ -325,3 +325,40 @@ class Resource(Base):
             f"{self.total_mem_mb}mb) "
             f"used=({self.used_cpus}cpu/{self.used_gpus}gpu/{self.used_mem_mb}mb)>"
         )
+
+
+class ApiToken(Base):
+    """
+    Represents a user API token for authentication.
+
+    Attributes
+    ----------
+    id : int
+        Auto-incrementing primary key.
+    username : str
+        OS username the token belongs to.
+    token_hash : str
+        SHA-256 hex digest of the raw token.
+    created_at : datetime.datetime
+        UTC timestamp when the token was created.
+    """
+
+    __tablename__ = "api_tokens"
+
+    id: sqlalchemy.orm.Mapped[int] = sqlalchemy.orm.mapped_column(
+        sqlalchemy.Integer, primary_key=True, autoincrement=True
+    )
+    username: sqlalchemy.orm.Mapped[str] = sqlalchemy.orm.mapped_column(
+        sqlalchemy.String(64), nullable=False, index=True
+    )
+    token_hash: sqlalchemy.orm.Mapped[str] = sqlalchemy.orm.mapped_column(
+        sqlalchemy.String(64), nullable=False, unique=True
+    )
+    created_at: sqlalchemy.orm.Mapped[datetime.datetime] = sqlalchemy.orm.mapped_column(
+        sqlalchemy.DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.datetime.now(datetime.timezone.utc),
+    )
+
+    def __repr__(self) -> str:
+        return f"<ApiToken id={self.id} username={self.username!r}>"

@@ -7,6 +7,7 @@ import typing
 import fastapi
 import uvicorn
 
+import qjob.api.routers.auth as auth_router
 import qjob.api.routers.jobs as jobs_router
 import qjob.api.routers.resources as resources_router
 import qjob.api.schemas as schemas
@@ -75,6 +76,7 @@ def create_app(db_url: str | None = None) -> fastapi.FastAPI:
 
     # -- Routers -----------------------------------------------------------------------
 
+    app.include_router(auth_router.router)
     app.include_router(jobs_router.router)
     app.include_router(resources_router.router)
 

@@ -33,6 +33,12 @@ admin_app = typer.Typer(
 )
 app.add_typer(admin_app, name="admin")
 
+auth_app = typer.Typer(
+    help="Authentication commands.",
+    no_args_is_help=True,
+)
+app.add_typer(auth_app, name="auth")
+
 
 def _version_callback(value: bool) -> None:
     if value:
@@ -86,10 +92,10 @@ def submit(
 
     try:
         info = service.submit_job(script_path=script)
-    except FileNotFoundError as exc:
+    except ConnectionError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1)
-    except ConnectionError as exc:
+    except FileNotFoundError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1)
     except Exception as exc:
@@ -229,7 +235,7 @@ def cancel(
     exit_code = 0
     for job_id in job_ids:
         try:
-            info = service.cancel_job(job_id)
+            info = service.cancel_job(job_id)  # authenticated via token
         except PermissionError as exc:
             typer.echo(f"Error: {exc}", err=True)
             exit_code = 1
@@ -405,6 +411,41 @@ def dash(
 
     database.init_db()
     dashboard.run(refresh_interval=refresh)
+
+
+# --------------------------------------------------------------------------------------
+# auth sub-commands
+
+
+@auth_app.command("init")
+def auth_init() -> None:
+    """
+    Create an API token for the current OS user and save it to
+    ~/.config/qjob/token.
+
+    The token is created on the server and stored locally with mode 0600.
+    Re-running this command creates an additional token (existing tokens
+    remain valid).
+    """
+
+    import getpass
+    import stat
+
+    username = getpass.getuser()
+
+    try:
+        token = service.create_token(username)
+    except ConnectionError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    token_path = service._TOKEN_PATH
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(token)
+    token_path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600
+
+    typer.echo(f"Token saved to {token_path}")
+    typer.echo(f"Authenticated as: {username}")
 
 
 # --------------------------------------------------------------------------------------

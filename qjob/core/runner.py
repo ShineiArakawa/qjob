@@ -5,6 +5,7 @@ import datetime
 import logging
 import os
 import pathlib
+import pwd
 import signal
 
 import qjob.core.database as database
@@ -173,6 +174,26 @@ async def _run_job(job: models.Job, resource_pool: object) -> None:
 # Subprocess helpers
 
 
+def _make_preexec_fn(username: str):
+    """Return a callable that drops privileges to *username* in the child process.
+
+    Privilege drop is only performed when the daemon runs as root.  When not
+    root the function is a no-op (the child inherits the daemon's identity).
+    """
+    pw = pwd.getpwnam(username)
+    uid, gid = pw.pw_uid, pw.pw_gid
+    running_as_root = os.getuid() == 0
+
+    def _drop_privileges() -> None:
+        if not running_as_root:
+            return
+        os.initgroups(username, gid)
+        os.setgid(gid)
+        os.setuid(uid)
+
+    return _drop_privileges
+
+
 async def _spawn(
     job:         models.Job,
     env:         dict[str, str],
@@ -223,6 +244,7 @@ async def _spawn(
             env=env,
             cwd=cwd,
             start_new_session=True,
+            preexec_fn=_make_preexec_fn(job.user),
         )
 
     logger.debug(
