@@ -438,8 +438,8 @@ def admin_set_resources(
     gpus: typing.Optional[int] = typer.Option(
         None, "--gpus", help="Total number of GPU devices."
     ),
-    mem: typing.Optional[int] = typer.Option(
-        None, "--mem", help="Total memory in megabytes."
+    mem: typing.Optional[str] = typer.Option(
+        None, "--mem", help="Total memory (e.g. 64G, 512M, 65536)."
     ),
     max_walltime: typing.Optional[str] = typer.Option(
         None, "--max-walltime", help="Maximum allowed walltime per job (HH:MM:SS or MM:SS)."
@@ -454,10 +454,20 @@ def admin_set_resources(
         )
         raise typer.Exit(code=1)
 
+    import qjob.core.parser as _parser
+
+    mem_mb: int | None = None
+    if mem is not None:
+        try:
+            # Bare integer (no unit) is treated as MB for admin use.
+            mem_mb = int(mem) if mem.strip().isdigit() else _parser._parse_mem(mem)
+        except (_parser.DirectiveParseError, ValueError) as exc:
+            typer.echo(f"Error: {exc}", err=True)
+            raise typer.Exit(code=1)
+
     max_walltime_sec: int | None = None
     if max_walltime is not None:
         try:
-            import qjob.core.parser as _parser
             max_walltime_sec = _parser._parse_walltime(max_walltime)
         except _parser.DirectiveParseError as exc:
             typer.echo(f"Error: {exc}", err=True)
@@ -467,7 +477,7 @@ def admin_set_resources(
         info = service.set_resources(
             total_cpus=cpus,
             total_gpus=gpus,
-            total_mem_mb=mem,
+            total_mem_mb=mem_mb,
             max_walltime_sec=max_walltime_sec,
         )
     except ValueError as exc:
