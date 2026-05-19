@@ -381,10 +381,11 @@ async def _async_submit_job(script_path: str) -> JobInfo:
     """Async implementation of submit_job."""
 
     workdir = os.getcwd()
+    abs_script_path = str(pathlib.Path(script_path).resolve())
     async with _async_client() as client:
         response = await client.post(
             "/jobs",
-            json={"script_path": script_path, "workdir": workdir},
+            json={"script_path": abs_script_path, "workdir": workdir},
         )
         _raise_for_status(response)
     return _parse_job(response.json())
