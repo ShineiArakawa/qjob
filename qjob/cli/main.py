@@ -26,7 +26,7 @@ _SCHEDULER_UNIT = "qjob-scheduler.service"
 
 app = typer.Typer(
     name="qjob",
-    help="Lightweight job scheduler for research servers.",
+    help="A lightweight job scheduler designed for single-node lab-scale GPU servers.",
     no_args_is_help=True,
 )
 
