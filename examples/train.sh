@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-#QJOB --name train-gpu --cpus 4 --gpus 1
-#QJOB --mem 8G --walltime 00:30:00 --priority normal
+#QJOB --name train-gpu --cpus 4 --gpus 3
+#QJOB --mem 8G --walltime 00:30:00 --priority 100
 
 set -euo pipefail
 

@@ -8,11 +8,9 @@ import typing
 
 import typer
 
-import qjob.api.server as server
 import qjob.cli.dashboard as dashboard
 import qjob.cli.service as service
 import qjob.core.database as database
-import qjob.core.scheduler as _scheduler
 
 # --------------------------------------------------------------------------------------
 # Constants
@@ -74,12 +72,26 @@ def _complete_status(incomplete: str) -> list[str]:
     return [v for v in values if v.startswith(incomplete)]
 
 
-def _complete_job_id(incomplete: str) -> list[str]:
+def _complete_job_id_filtered(
+    incomplete: str,
+    status_filter: list[str] | None = None,
+) -> list[str]:
     try:
         jobs = service.list_jobs(user=None)
-        return [j.id for j in jobs if j.id.startswith(incomplete)]
+        jobs = [j for j in jobs if j.id.startswith(incomplete)]
+        if status_filter:
+            jobs = [j for j in jobs if j.status in status_filter]
+        return [j.id for j in jobs]
     except Exception:
         return []
+
+
+def _complete_job_id(incomplete: str) -> list[str]:
+    return _complete_job_id_filtered(incomplete)
+
+
+def _complete_cancellable_job_id(incomplete: str) -> list[str]:
+    return _complete_job_id_filtered(incomplete, status_filter=["queued", "running"])
 
 
 # --------------------------------------------------------------------------------------
@@ -194,7 +206,7 @@ def status(
 @app.command()
 def cancel(
     job_ids: typing.Optional[typing.List[str]] = typer.Argument(
-        None, help="IDs of the jobs to cancel.", autocompletion=_complete_job_id
+        None, help="IDs of the jobs to cancel.", autocompletion=_complete_cancellable_job_id,
     ),
     all_jobs: bool = typer.Option(
         False, "--all", "-a", help="Cancel all your queued and running jobs."
@@ -593,6 +605,8 @@ def admin_serve(
     as a separate process.  Press Ctrl+C to stop.
     """
 
+    import qjob.api.server as server
+
     if os.getuid() != 0:
         typer.echo("Error: 'qjob admin serve' must be run as root.", err=True)
         raise typer.Exit(code=1)
@@ -625,6 +639,8 @@ def admin_scheduler(
     Only one scheduler may run at a time; a second invocation will exit
     immediately with an error.  Press Ctrl+C to stop gracefully.
     """
+
+    import qjob.core.scheduler as _scheduler
 
     if os.getuid() != 0:
         typer.echo("Error: 'qjob admin scheduler' must be run as root.", err=True)

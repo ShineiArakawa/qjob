@@ -24,12 +24,14 @@ class Base(sqlalchemy.orm.DeclarativeBase):
 class JobStatus(str, enum.Enum):
     """Lifecycle states of a job."""
 
-    QUEUED = "queued"
-    RUNNING = "running"
-    CANCELLING = "cancelling"
-    DONE = "done"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
+    # autopep8: off
+    QUEUED        = "queued"
+    RUNNING       = "running"
+    CANCELLING    = "cancelling"
+    DONE          = "done"
+    FAILED        = "failed"
+    CANCELLED     = "cancelled"
+    # autopep8: on
 
 
 # --------------------------------------------------------------------------------------
@@ -167,6 +169,15 @@ class Job(Base):
         sqlalchemy.Index("ix_jobs_status",   "status"),
         sqlalchemy.Index("ix_jobs_user",     "user"),
         sqlalchemy.Index("ix_jobs_priority", "priority"),
+        sqlalchemy.Index("ix_jobs_submitted_at", "submitted_at"),
+        sqlalchemy.Index("ix_jobs_user_submitted_at", "user", "submitted_at"),
+        sqlalchemy.Index("ix_jobs_status_submitted_at", "status", "submitted_at"),
+        sqlalchemy.Index(
+            "ix_jobs_user_status_submitted_at",
+            "user",
+            "status",
+            "submitted_at",
+        ),
     )
 
     # -- Factory ------------------------------------------------------------------------

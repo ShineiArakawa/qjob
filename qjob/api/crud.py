@@ -174,13 +174,46 @@ def submit_job(
     """
 
     resolved_user = user
+
+    # --------------------------------------------------------------------------------------
+    # Parse directives from the script file.
+
     directives = parser.parse_script(pathlib.Path(script_path))
+
+    # --------------------------------------------------------------------------------------
+    # If no name directive was given, generate a random human-readable name.
+
     if directives.name is None:
         directives.name = coolname.generate_slug(2)
 
+    # --------------------------------------------------------------------------------------
+    # Check current resource limits and apply defaults as needed.
+
     with database.get_session() as session:
         resource_row: models.Resource | None = session.get(models.Resource, 1)
+
+        total_cpus = resource_row.total_cpus if resource_row is not None else None
+        total_gpus = resource_row.total_gpus if resource_row is not None else None
+        total_mem_mb = resource_row.total_mem_mb if resource_row is not None else None
         max_walltime = resource_row.max_walltime_sec if resource_row is not None else None
+
+    if total_cpus is not None and (directives.cpus < 1 or directives.cpus > total_cpus):
+        raise ValueError(
+            f"Requested CPU count {directives.cpus} is out of bounds "
+            f"(1–{total_cpus})."
+        )
+
+    if total_gpus is not None and (directives.gpus < 0 or directives.gpus > total_gpus):
+        raise ValueError(
+            f"Requested GPU count {directives.gpus} is out of bounds "
+            f"(0–{total_gpus})."
+        )
+
+    if total_mem_mb is not None and (directives.mem_mb < 1 or directives.mem_mb > total_mem_mb):
+        raise ValueError(
+            f"Requested memory {directives.mem_mb} MB is out of bounds "
+            f"(1–{total_mem_mb} MB)."
+        )
 
     if max_walltime is not None:
         if directives.walltime_sec is None:
@@ -190,6 +223,9 @@ def submit_job(
                 f"Requested walltime {directives.walltime_sec}s exceeds "
                 f"the maximum allowed {max_walltime}s."
             )
+
+    # --------------------------------------------------------------------------------------
+    # Create a new Job record in the database with the parsed directives and defaults.
 
     resolved_workdir = _resolve_workdir(workdir, directives.script_path)
     job = models.Job.from_directives(
