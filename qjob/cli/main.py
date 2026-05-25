@@ -76,6 +76,12 @@ def _complete_status(incomplete: str) -> list[str]:
     return [v for v in _JOB_STATES if v.startswith(incomplete)]
 
 
+def _complete_state_filter(incomplete: str) -> list[str]:
+    prefix, separator, current = incomplete.rpartition(",")
+    base = f"{prefix}{separator}" if separator else ""
+    return [f"{base}{v}" for v in _JOB_STATES if v.startswith(current)]
+
+
 def _complete_sort(incomplete: str) -> list[str]:
     return [v for v in _JOB_SORT_KEYS if v.startswith(incomplete)]
 
@@ -258,7 +264,7 @@ def status(
     state_filter: typing.Optional[str] = typer.Option(
         None, "--state", "-s",
         help="Filter by state. Comma-separated values are accepted.",
-        autocompletion=_complete_status,
+        autocompletion=_complete_state_filter,
     ),
     since_filter: typing.Optional[str] = typer.Option(
         None,
@@ -274,17 +280,6 @@ def status(
         help="Sort by submitted, started, finished, priority, or user.",
         autocompletion=_complete_sort,
     ),
-    status_filter_legacy: typing.Optional[str] = typer.Option(
-        None,
-        "--status",
-        help="Deprecated alias for --state.",
-        autocompletion=_complete_status,
-    ),
-    all_jobs_legacy: bool = typer.Option(
-        False,
-        "--all-jobs",
-        help="Deprecated alias for --all.",
-    ),
 ) -> None:
     """
     Show job status.
@@ -296,11 +291,6 @@ def status(
         typer.echo("Error: --all-users and --user cannot be combined.", err=True)
         raise typer.Exit(code=1)
 
-    if state_filter is not None and status_filter_legacy is not None:
-        typer.echo("Error: --state and --status cannot be combined.", err=True)
-        raise typer.Exit(code=1)
-
-    show_all = show_all or all_jobs_legacy
     if show_all and limit is not None:
         typer.echo("Error: --all and --limit cannot be combined.", err=True)
         raise typer.Exit(code=1)
@@ -312,9 +302,8 @@ def status(
         typer.echo(f"Error: --limit must be <= {_MAX_STATUS_LIMIT}.", err=True)
         raise typer.Exit(code=1)
 
-    state_value = state_filter if state_filter is not None else status_filter_legacy
     try:
-        states = _parse_states(state_value) if state_value is not None else None
+        states = _parse_states(state_filter) if state_filter is not None else None
     except ValueError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1)
@@ -759,7 +748,8 @@ def admin_list_jobs(
     """List all jobs from all users (admin view)."""
 
     try:
-        jobs = service.list_jobs(user=None, all_users=True, status=status_filter)
+        states = [status_filter] if status_filter is not None else None
+        jobs = service.list_jobs(user=None, all_users=True, states=states)
     except ValueError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1)

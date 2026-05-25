@@ -249,12 +249,6 @@ class TestListJobs:
         data = client.get("/jobs", params={"user": "alice"}).json()
         assert all(j["user"] == "alice" for j in data["jobs"])
 
-    def test_filter_by_status(self, client):
-        _persist_job(status=models.JobStatus.QUEUED)
-        _persist_job(status=models.JobStatus.DONE)
-        data = client.get("/jobs", params={"status": "queued"}).json()
-        assert all(j["status"] == "queued" for j in data["jobs"])
-
     def test_filter_by_state(self, client):
         _persist_job(status=models.JobStatus.QUEUED)
         _persist_job(status=models.JobStatus.DONE)
@@ -271,19 +265,8 @@ class TestListJobs:
         assert data["total"] == 2
         assert {j["status"] for j in data["jobs"]} == {"queued", "running"}
 
-    def test_invalid_status_returns_400(self, client):
-        response = client.get("/jobs", params={"status": "invalid"})
-        assert response.status_code == 400
-
     def test_invalid_state_returns_400(self, client):
         response = client.get("/jobs", params={"state": "invalid"})
-        assert response.status_code == 400
-
-    def test_status_and_state_returns_400(self, client):
-        response = client.get(
-            "/jobs",
-            params={"status": "queued", "state": "running"},
-        )
         assert response.status_code == 400
 
     def test_filter_by_since(self, client):

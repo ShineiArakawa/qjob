@@ -85,10 +85,6 @@ def list_jobs(
         None,
         description="Filter by comma-separated job states.",
     ),
-    status:       typing.Optional[str] = fastapi.Query(
-        None,
-        description="Deprecated alias for state. Accepts a single job state.",
-    ),
     since:        typing.Optional[datetime.datetime] = fastapi.Query(
         None,
         description="Only include jobs submitted at or after this timestamp.",
@@ -120,8 +116,6 @@ def list_jobs(
         When True, non-admin users may see jobs from all users.
     state : str | None
         Comma-separated state filter.
-    status : str | None
-        Legacy single-state filter.
     since : datetime.datetime | None
         Submitted-at lower bound.
     sort : str
@@ -142,16 +136,9 @@ def list_jobs(
     if not auth.is_admin(current_user):
         user = None if all_users else current_user
 
-    if state is not None and status is not None:
-        raise fastapi.HTTPException(
-            status_code=400,
-            detail="state and status cannot both be specified.",
-        )
-
     try:
         page = crud.list_jobs(
             user=user,
-            status=status,
             states=_split_state_filter(state),
             since=since,
             sort=sort,

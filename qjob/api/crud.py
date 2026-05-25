@@ -287,7 +287,6 @@ def get_job(job_id: str) -> JobInfo | None:
 
 def list_jobs(
     user:   str | None = None,
-    status: str | None = None,
     states: list[str] | None = None,
     since:  datetime.datetime | None = None,
     sort:   str = "submitted",
@@ -301,8 +300,6 @@ def list_jobs(
     ----------
     user : str | None
         When given, only jobs submitted by this user are returned.
-    status : str | None
-        Legacy single-state filter.  When given, only jobs in this state are returned.
     states : list[str] | None
         When given, only jobs in these states are returned.
     since : datetime.datetime | None
@@ -322,7 +319,7 @@ def list_jobs(
     Raises
     ------
     ValueError
-        If *status*, *states*, *since*, *sort*, *limit*, or *offset* is invalid.
+        If *states*, *since*, *sort*, *limit*, or *offset* is invalid.
     """
 
     if limit <= 0:
@@ -338,20 +335,14 @@ def list_jobs(
             f"Invalid sort {sort!r}. Valid values: {list(JOB_LIST_SORT_KEYS)}"
         )
 
-    if status is not None and states is not None:
-        raise ValueError("status and states cannot both be specified.")
-
-    requested_states = (
-        states if states is not None else ([status] if status is not None else None)
-    )
     status_filters: list[models.JobStatus] | None = None
-    if requested_states is not None:
-        if not requested_states:
+    if states is not None:
+        if not states:
             raise ValueError("states must not be empty.")
         status_filters = []
         seen: set[models.JobStatus] = set()
         valid = [s.value for s in models.JobStatus]
-        for state in requested_states:
+        for state in states:
             try:
                 status_filter = models.JobStatus(state)
             except ValueError:

@@ -215,7 +215,6 @@ def get_job(job_id: str) -> JobInfo | None:
 def list_jobs(
     user:      str | None = None,
     all_users: bool = False,
-    status:    str | None = None,
     limit:     int | None = None,
     offset:    int = 0,
     states:    list[str] | None = None,
@@ -223,7 +222,7 @@ def list_jobs(
     sort:      str = "submitted",
 ) -> list[JobInfo]:
     """
-    Return a list of jobs, optionally filtered by user and/or status.
+    Return a list of jobs, optionally filtered by user and/or state.
 
     Parameters
     ----------
@@ -231,8 +230,6 @@ def list_jobs(
         When given, only jobs submitted by this user are returned.
     all_users : bool
         When True, request jobs from all users (subject to server-side auth).
-    status : str | None
-        Legacy single-state filter.  When given, only jobs in this state are returned.
     states : list[str] | None
         When given, only jobs in these states are returned.
     since : datetime.datetime | None
@@ -253,14 +250,11 @@ def list_jobs(
     Raises
     ------
     ValueError
-        If *status* or *states* contains an invalid ``JobStatus`` value.
+        If *states* contains an invalid ``JobStatus`` value.
     """
 
-    if status is not None and states is not None:
-        raise ValueError("status and states cannot both be specified.")
-
     return _run(
-        _async_list_jobs(user, all_users, status, limit, offset, states, since, sort)
+        _async_list_jobs(user, all_users, limit, offset, states, since, sort)
     )
 
 
@@ -426,7 +420,6 @@ async def _async_get_job(job_id: str) -> JobInfo | None:
 async def _async_list_jobs(
     user:      str | None,
     all_users: bool,
-    status:    str | None,
     limit:     int | None,
     offset:    int,
     states:    list[str] | None,
@@ -441,7 +434,6 @@ async def _async_list_jobs(
                 client,
                 user=user,
                 all_users=all_users,
-                status=status,
                 states=states,
                 since=since,
                 sort=sort,
@@ -458,7 +450,6 @@ async def _async_list_jobs(
                 client,
                 user=user,
                 all_users=all_users,
-                status=status,
                 states=states,
                 since=since,
                 sort=sort,
@@ -476,7 +467,6 @@ async def _fetch_jobs_page(
     client:    httpx.AsyncClient,
     user:      str | None,
     all_users: bool,
-    status:    str | None,
     states:    list[str] | None,
     since:     datetime.datetime | None,
     sort:      str,
@@ -498,8 +488,6 @@ async def _fetch_jobs_page(
         params["state"] = ",".join(states)
     if since is not None:
         params["since"] = since.isoformat()
-    if status is not None:
-        params["status"] = status
 
     response = await client.get("/jobs", params=params)
     if response.status_code == 400:
