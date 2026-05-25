@@ -31,7 +31,7 @@ def _load_token() -> str:
         return token_path.read_text().strip()
     except FileNotFoundError:
         raise ConnectionError(
-            f"No API token found at {token_path}. Run 'qjob auth init' first."
+            f"No API token found at {token_path}. Please ask your administrator for a token and save it to this file."
         )
 
 

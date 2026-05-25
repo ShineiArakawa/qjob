@@ -11,7 +11,7 @@ The project is intended for small to medium shared GPU servers used in research 
 - Priority aging and EASY-style backfilling.
 - PostgreSQL-backed persistent job and resource state.
 - FastAPI-based REST API with Bearer-token authentication.
-- systemd service integration with `qjob up` / `qjob down` for single-command startup.
+- systemd service integration with `qjob admin up` / `qjob admin down` for single-command startup.
 - Root-managed execution with privilege dropping to the submitting OS user.
 - CPU affinity via `taskset` and GPU assignment through `CUDA_VISIBLE_DEVICES`.
 - Terminal dashboard for local resource and queue monitoring.
@@ -115,13 +115,13 @@ sudo qjob admin install \
 By default both services are enabled to start on boot (`--no-enable` to opt out). After installation, start them immediately:
 
 ```bash
-sudo qjob up
+sudo qjob admin up
 ```
 
 To stop both services:
 
 ```bash
-sudo qjob down
+sudo qjob admin down
 ```
 
 To remove the unit files entirely:
@@ -273,19 +273,20 @@ The CLI validates the script locally and then sends its absolute path and the cu
 qjob status
 qjob status <job_id>
 qjob status --status running
-qjob status --all-jobs
+qjob status --all
 ```
 
-By default, `qjob status` lists the latest 10 jobs for the current OS user. Use `--all-jobs` to fetch all matching jobs.
+By default, `qjob status` lists the latest 20 jobs for the current OS user. Use `--all` to fetch all matching jobs for the current user.
 
 Additional filters:
 
 ```bash
 qjob status --user alice
-qjob status --all
+qjob status --all-users
+qjob status --all-users --all
 ```
 
-Administrators can view all users' jobs. Non-admin users are restricted by server-side authorization policy for most operations.
+Administrators can use `--all-users` to view jobs across users, or `--user USER` to inspect a specific user. Non-admin users are restricted by server-side authorization policy for most operations.
 
 ### Cancel jobs
 
@@ -327,8 +328,8 @@ The dashboard reads the local database directly and is intended for use on the q
 
 | Command | Purpose |
 | --- | --- |
-| `qjob up` | Start the API server and scheduler via systemd. Requires root. |
-| `qjob down` | Stop both services via systemd. Requires root. |
+| `qjob admin up` | Start the API server and scheduler via systemd. Requires root. |
+| `qjob admin down` | Stop both services via systemd. Requires root. |
 | `qjob admin install` | Generate systemd unit files, reload the daemon, and optionally enable services. Requires root. |
 | `qjob admin uninstall` | Stop, disable, and remove the systemd unit files. Requires root. |
 | `qjob admin create-token <username>` | Create a token directly in the database. Requires root. Used for bootstrap or recovery. |

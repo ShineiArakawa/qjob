@@ -15,7 +15,7 @@ import qjob.core.database as database
 # --------------------------------------------------------------------------------------
 # Constants
 
-_DEFAULT_STATUS_LIMIT = 10
+_DEFAULT_STATUS_LIMIT = 20
 
 _SYSTEMD_DIR = pathlib.Path("/etc/systemd/system")
 _SERVER_UNIT = "qjob-server.service"
@@ -28,6 +28,7 @@ app = typer.Typer(
     name="qjob",
     help="A lightweight job scheduler designed for single-node lab-scale GPU servers.",
     no_args_is_help=True,
+    context_settings={"help_option_names": ["-h", "--help"]},
 )
 
 admin_app = typer.Typer(
@@ -159,16 +160,26 @@ def status(
     user: typing.Optional[str] = typer.Option(
         None, "--user", "-u", help="Filter by username."
     ),
+    show_all: bool = typer.Option(
+        False,
+        "--all",
+        "-a",
+        help=f"Show all matching jobs instead of the latest {_DEFAULT_STATUS_LIMIT}.",
+    ),
     all_users: bool = typer.Option(
-        False, "--all", "-a", help="Show jobs from all users (default: current user)."
+        False,
+        "--all-users",
+        help="Show jobs from all users instead of the current user.",
     ),
     status_filter: typing.Optional[str] = typer.Option(
         None, "--status", "-s",
         help="Filter by status: queued, running, done, failed, cancelled.",
         autocompletion=_complete_status,
     ),
-    all_jobs: bool = typer.Option(
-        False, "--all-jobs", help="Show all matching jobs instead of the latest 10."
+    all_jobs_legacy: bool = typer.Option(
+        False,
+        "--all-jobs",
+        help="Deprecated alias for --all.",
     ),
 ) -> None:
     """
@@ -178,7 +189,7 @@ def status(
     """
 
     if all_users and user is not None:
-        typer.echo("Error: --all and --user cannot be combined.", err=True)
+        typer.echo("Error: --all-users and --user cannot be combined.", err=True)
         raise typer.Exit(code=1)
 
     if job_id is not None:
@@ -193,10 +204,15 @@ def status(
         _print_job_detail(info)
         return
 
+    show_all = show_all or all_jobs_legacy
     resolved_user = None if all_users else (user or os.environ.get("USER"))
     try:
-        if all_jobs:
-            jobs = service.list_jobs(user=resolved_user, all_users=all_users, status=status_filter)
+        if show_all:
+            jobs = service.list_jobs(
+                user=resolved_user,
+                all_users=all_users,
+                status=status_filter,
+            )
             truncated = False
         else:
             jobs = service.list_jobs(
@@ -359,17 +375,17 @@ def dash(
 
 
 # --------------------------------------------------------------------------------------
-# up / down
+# admin up / down
 
 
-@app.command()
+@admin_app.command("up")
 def up() -> None:
     """Start qjob services (API server + scheduler) via systemd."""
 
     import subprocess
 
     if os.getuid() != 0:
-        typer.echo("Error: 'qjob up' must be run as root.", err=True)
+        typer.echo("Error: 'qjob admin up' must be run as root.", err=True)
         raise typer.Exit(code=1)
 
     for unit in (_SERVER_UNIT, _SCHEDULER_UNIT):
@@ -390,14 +406,14 @@ def up() -> None:
     typer.echo("qjob services started.")
 
 
-@app.command()
+@admin_app.command("down")
 def down() -> None:
     """Stop qjob services (scheduler + API server) via systemd."""
 
     import subprocess
 
     if os.getuid() != 0:
-        typer.echo("Error: 'qjob down' must be run as root.", err=True)
+        typer.echo("Error: 'qjob admin down' must be run as root.", err=True)
         raise typer.Exit(code=1)
 
     try:
@@ -733,7 +749,7 @@ def admin_install(
 
     Writes qjob-server.service and qjob-scheduler.service to
     /etc/systemd/system/, reloads the systemd daemon, and optionally
-    enables both services.  Run 'qjob up' to start them immediately.
+    enables both services.  Run 'qjob admin up' to start them immediately.
     """
 
     import subprocess
@@ -774,7 +790,7 @@ def admin_install(
         typer.echo(f"Error: systemctl exited with code {exc.returncode}.", err=True)
         raise typer.Exit(code=1)
 
-    typer.echo("Run 'qjob up' to start the services now.")
+    typer.echo("Run 'qjob admin up' to start the services now.")
 
 
 @admin_app.command("uninstall")
