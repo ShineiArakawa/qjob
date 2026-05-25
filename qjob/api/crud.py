@@ -22,6 +22,21 @@ MAX_LOG_MAX_BYTES:     int = 16 * 1024 * 1024
 DEFAULT_JOB_LIST_LIMIT: int = 100
 MAX_JOB_LIST_LIMIT:     int = 1000
 
+
+def _normalise_gpu_ids(gpu_ids: list[int]) -> list[int]:
+    """Validate and return GPU IDs in administrator-specified order."""
+
+    normalised: list[int] = []
+    for gpu_id in gpu_ids:
+        if isinstance(gpu_id, bool) or not isinstance(gpu_id, int):
+            raise ValueError("gpu_ids must contain only integer GPU IDs.")
+        if gpu_id < 0:
+            raise ValueError("gpu_ids must contain only non-negative GPU IDs.")
+        normalised.append(gpu_id)
+    if len(set(normalised)) != len(normalised):
+        raise ValueError("gpu_ids must not contain duplicates.")
+    return normalised
+
 # --------------------------------------------------------------------------------------
 # Return value data classes
 #
@@ -113,6 +128,7 @@ class ResourceInfo:
     used_cpus:        int
     used_gpus:        int
     used_mem_mb:      int
+    gpu_ids:          list[int] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -193,7 +209,7 @@ def submit_job(
         resource_row: models.Resource | None = session.get(models.Resource, 1)
 
         total_cpus = resource_row.total_cpus if resource_row is not None else None
-        total_gpus = resource_row.total_gpus if resource_row is not None else None
+        total_gpus = len(resource_row.configured_gpu_ids) if resource_row is not None else None
         total_mem_mb = resource_row.total_mem_mb if resource_row is not None else None
         max_walltime = resource_row.max_walltime_sec if resource_row is not None else None
 
@@ -478,14 +494,17 @@ def get_resources() -> ResourceInfo:
             return ResourceInfo(
                 total_cpus=0, total_gpus=0, total_mem_mb=0,
                 max_walltime_sec=None,
+                gpu_ids=[],
                 used_cpus=0,  used_gpus=0,  used_mem_mb=0,
             )
 
+        gpu_ids = row.configured_gpu_ids
         return ResourceInfo(
             total_cpus=row.total_cpus,
-            total_gpus=row.total_gpus,
+            total_gpus=len(gpu_ids),
             total_mem_mb=row.total_mem_mb,
             max_walltime_sec=row.max_walltime_sec,
+            gpu_ids=gpu_ids,
             used_cpus=row.used_cpus,
             used_gpus=row.used_gpus,
             used_mem_mb=row.used_mem_mb,
@@ -497,6 +516,7 @@ def set_resources(
     total_gpus:       int | None = None,
     total_mem_mb:     int | None = None,
     max_walltime_sec: int | None = None,
+    gpu_ids:          list[int] | None = None,
 ) -> ResourceInfo:
     """
     Update the resource limits.
@@ -521,7 +541,7 @@ def set_resources(
         If all arguments are ``None``.
     """
 
-    if total_cpus is None and total_gpus is None and total_mem_mb is None and max_walltime_sec is None:
+    if total_cpus is None and total_gpus is None and total_mem_mb is None and max_walltime_sec is None and gpu_ids is None:
         raise ValueError("At least one resource field must be specified.")
     if total_cpus is not None and total_cpus <= 0:
         raise ValueError("total_cpus must be greater than 0.")
@@ -532,6 +552,14 @@ def set_resources(
     if max_walltime_sec is not None and max_walltime_sec <= 0:
         raise ValueError("max_walltime_sec must be greater than 0.")
 
+    normalised_gpu_ids = _normalise_gpu_ids(gpu_ids) if gpu_ids is not None else None
+    if (
+        total_gpus is not None
+        and normalised_gpu_ids is not None
+        and total_gpus != len(normalised_gpu_ids)
+    ):
+        raise ValueError("total_gpus must match the number of gpu_ids when both are set.")
+
     with database.get_session() as session:
         row: models.Resource | None = session.get(models.Resource, 1)
         if row is None:
@@ -541,7 +569,9 @@ def set_resources(
         if total_cpus is not None:
             row.total_cpus = total_cpus
         if total_gpus is not None:
-            row.total_gpus = total_gpus
+            row.set_configured_gpu_ids(list(range(total_gpus)))
+        if normalised_gpu_ids is not None:
+            row.set_configured_gpu_ids(normalised_gpu_ids)
         if total_mem_mb is not None:
             row.total_mem_mb = total_mem_mb
         if max_walltime_sec is not None:
@@ -549,11 +579,13 @@ def set_resources(
 
         row.updated_at = datetime.datetime.now(datetime.timezone.utc)
 
+        current_gpu_ids = row.configured_gpu_ids
         return ResourceInfo(
             total_cpus=row.total_cpus,
-            total_gpus=row.total_gpus,
+            total_gpus=len(current_gpu_ids),
             total_mem_mb=row.total_mem_mb,
             max_walltime_sec=row.max_walltime_sec,
+            gpu_ids=current_gpu_ids,
             used_cpus=row.used_cpus,
             used_gpus=row.used_gpus,
             used_mem_mb=row.used_mem_mb,

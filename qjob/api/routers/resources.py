@@ -84,6 +84,7 @@ def update_resources(
             total_gpus=body.total_gpus,
             total_mem_mb=body.total_mem_mb,
             max_walltime_sec=body.max_walltime_sec,
+            gpu_ids=body.gpu_ids,
         )
     except ValueError as exc:
         raise fastapi.HTTPException(status_code=400, detail=str(exc))
@@ -115,6 +116,7 @@ def _info_to_response(info: crud.ResourceInfo) -> schemas.ResourceResponse:
         total_gpus=info.total_gpus,
         total_mem_mb=info.total_mem_mb,
         max_walltime_sec=info.max_walltime_sec,
+        gpu_ids=info.gpu_ids,
         used_cpus=info.used_cpus,
         used_gpus=info.used_gpus,
         used_mem_mb=info.used_mem_mb,

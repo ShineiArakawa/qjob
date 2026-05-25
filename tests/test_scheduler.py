@@ -109,6 +109,15 @@ class TestResourcePoolFromRow:
             pool = scheduler.ResourcePool.from_resource_row(row)
         assert pool.free_gpu_ids == [0, 1]
 
+    def test_configured_gpu_ids_free_initially(self):
+        with database.get_session() as session:
+            row = session.get(models.Resource, 1)
+            row.set_configured_gpu_ids([2, 5])
+        with database.get_session() as session:
+            row = session.get(models.Resource, 1)
+            pool = scheduler.ResourcePool.from_resource_row(row)
+        assert pool.free_gpu_ids == [2, 5]
+
 
 # --------------------------------------------------------------------------------------
 # ResourcePool.can_fit

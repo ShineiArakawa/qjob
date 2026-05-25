@@ -384,6 +384,31 @@ class TestTickAllocation:
         assert len(launched) == 2
         assert gpus_a.isdisjoint(gpus_b)
 
+    def test_gpu_allocations_use_configured_device_ids(self, monkeypatch):
+        launched: list[str] = []
+
+        def _fake_start_job(job, resource_pool):
+            launched.append(job.id)
+
+        monkeypatch.setattr(scheduler.runner, "start_job", _fake_start_job)
+
+        job = _make_queued_job(req_cpus=1, req_gpus=2)
+        with database.get_session() as session:
+            row = session.get(models.Resource, 1)
+            row.total_cpus = 1
+            row.set_configured_gpu_ids([2, 5])
+            row.total_mem_mb = 4096
+
+        sched = _make_scheduler(max_workers=1)
+        asyncio.run(sched._tick())
+
+        with database.get_session() as session:
+            stored = session.get(models.Job, job.id)
+            gpu_ids = json.loads(stored.assigned_gpus)
+
+        assert launched == [job.id]
+        assert gpu_ids == [2, 5]
+
     def test_launched_job_is_marked_running_in_scheduler_transaction(self, monkeypatch):
         launched: list[str] = []
 

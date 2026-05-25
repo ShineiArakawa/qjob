@@ -155,6 +155,7 @@ class ResourceInfo:
     used_cpus:        int
     used_gpus:        int
     used_mem_mb:      int
+    gpu_ids:          list[int] = dataclasses.field(default_factory=list)
 
 
 # --------------------------------------------------------------------------------------
@@ -345,6 +346,7 @@ def set_resources(
     total_gpus:       int | None = None,
     total_mem_mb:     int | None = None,
     max_walltime_sec: int | None = None,
+    gpu_ids:          list[int] | None = None,
 ) -> ResourceInfo:
     """
     Update the resource limits (admin only).
@@ -371,9 +373,9 @@ def set_resources(
         If all arguments are None.
     """
 
-    if total_cpus is None and total_gpus is None and total_mem_mb is None and max_walltime_sec is None:
+    if total_cpus is None and total_gpus is None and total_mem_mb is None and max_walltime_sec is None and gpu_ids is None:
         raise ValueError("At least one resource field must be specified.")
-    return _run(_async_set_resources(total_cpus, total_gpus, total_mem_mb, max_walltime_sec))
+    return _run(_async_set_resources(total_cpus, total_gpus, total_mem_mb, max_walltime_sec, gpu_ids))
 
 
 # --------------------------------------------------------------------------------------
@@ -526,6 +528,7 @@ async def _async_set_resources(
     total_gpus:       int | None,
     total_mem_mb:     int | None,
     max_walltime_sec: int | None,
+    gpu_ids:          list[int] | None,
 ) -> ResourceInfo:
     """Async implementation of set_resources."""
 
@@ -534,6 +537,8 @@ async def _async_set_resources(
         body["total_cpus"] = total_cpus
     if total_gpus is not None:
         body["total_gpus"] = total_gpus
+    if gpu_ids is not None:
+        body["gpu_ids"] = gpu_ids
     if total_mem_mb is not None:
         body["total_mem_mb"] = total_mem_mb
     if max_walltime_sec is not None:
@@ -642,6 +647,7 @@ def _parse_resource(data: dict) -> ResourceInfo:
         total_gpus=data["total_gpus"],
         total_mem_mb=data["total_mem_mb"],
         max_walltime_sec=data.get("max_walltime_sec"),
+        gpu_ids=data.get("gpu_ids", list(range(data["total_gpus"]))),
         used_cpus=data["used_cpus"],
         used_gpus=data["used_gpus"],
         used_mem_mb=data["used_mem_mb"],

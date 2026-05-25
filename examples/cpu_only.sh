@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#QJOB --name cpu-only-demo --cpus 2 --gpus 0
+#QJOB --name cpu-only-demo --cpus 1 --gpus 0
 #QJOB --mem 1G --walltime 00:05:00 --priority normal
 
 set -euo pipefail
@@ -18,7 +18,7 @@ print("Starting CPU-only workload")
 payload = b"qjob-cpu-demo" * 100_000
 digest = ""
 
-for step in range(1, 120):
+for step in range(1, 6):
     digest = hashlib.sha256(payload + str(step).encode()).hexdigest()
     print(f"step={step} digest={digest[:16]}")
     time.sleep(1)

@@ -156,6 +156,14 @@ Set the total resources managed by qjob:
 qjob admin set-resources --cpus 32 --gpus 4 --mem 1T
 ```
 
+`--gpus` keeps the legacy count-based behavior and manages GPU IDs
+`0..N-1`. To manage a non-contiguous or explicit device set, use
+`--gpu-ids`:
+
+```bash
+qjob admin set-resources --gpu-ids 0,2,5
+```
+
 A maximum per-job walltime can also be configured:
 
 ```bash
@@ -245,7 +253,7 @@ The following variables are injected into the job environment:
 | `QJOB_JOB_ID` | 12-character lowercase hexadecimal job ID. |
 | `QJOB_JOB_NAME` | Job name. |
 | `QJOB_USER` | Submitting username. |
-| `CUDA_VISIBLE_DEVICES` | Comma-separated assigned GPU indices, or an empty string for CPU-only jobs. |
+| `CUDA_VISIBLE_DEVICES` | Comma-separated assigned GPU device IDs, or an empty string for CPU-only jobs. |
 
 The runner begins from the scheduler process environment. Therefore, environment variables available to the scheduler may also be visible to jobs unless explicitly controlled by deployment policy.
 
@@ -304,7 +312,7 @@ The API returns a bounded tail of the selected log stream. The default maximum i
 qjob resources
 ```
 
-This prints configured totals, current usage, free resources, and the configured maximum walltime.
+This prints configured totals, current usage, free resources, configured GPU IDs, and the configured maximum walltime.
 
 ### Open the dashboard
 
@@ -325,7 +333,7 @@ The dashboard reads the local database directly and is intended for use on the q
 | `qjob admin uninstall` | Stop, disable, and remove the systemd unit files. Requires root. |
 | `qjob admin create-token <username>` | Create a token directly in the database. Requires root. Used for bootstrap or recovery. |
 | `qjob admin init-token [--username USER]` | Create a token through the API. Requires an admin token. |
-| `qjob admin set-resources` | Update total CPUs, GPUs, memory, or maximum walltime. Requires admin privileges. |
+| `qjob admin set-resources` | Update total CPUs, GPU count or GPU IDs, memory, or maximum walltime. Requires admin privileges. |
 | `qjob admin list-jobs` | List jobs across all users. Requires admin privileges. |
 | `qjob admin serve` | Start the FastAPI server directly (without systemd). Requires root. |
 | `qjob admin scheduler` | Start the scheduler directly (without systemd). Requires root. |

@@ -108,10 +108,10 @@ class ResourcePool:
 
         return cls(
             total_cpus=row.total_cpus,
-            total_gpus=row.total_gpus,
+            total_gpus=len(row.configured_gpu_ids),
             total_mem_mb=row.total_mem_mb,
             free_cpu_ids=list(range(row.total_cpus)),
-            free_gpu_ids=list(range(row.total_gpus)),
+            free_gpu_ids=list(row.configured_gpu_ids),
         )
 
     # -- Allocation --------------------------------------------------------------------
@@ -239,13 +239,15 @@ class ResourcePool:
                 occupied_gpus.update(json.loads(rj.assigned_gpus))
 
         self.total_cpus = row.total_cpus
-        self.total_gpus = row.total_gpus
+        configured_gpu_ids = row.configured_gpu_ids
+
+        self.total_gpus = len(configured_gpu_ids)
         self.total_mem_mb = row.total_mem_mb
         self.free_cpu_ids = sorted(
             set(range(row.total_cpus)) - occupied_cpus
         )
         self.free_gpu_ids = sorted(
-            set(range(row.total_gpus)) - occupied_gpus
+            set(configured_gpu_ids) - occupied_gpus
         )
 
 
@@ -770,7 +772,7 @@ class Scheduler:
             i for i in range(resource_row.total_cpus) if i not in occupied_cpus
         ]
         free_gpus = [
-            i for i in range(resource_row.total_gpus) if i not in occupied_gpus
+            i for i in resource_row.configured_gpu_ids if i not in occupied_gpus
         ]
 
         cpu_ids = free_cpus[:job.req_cpus]

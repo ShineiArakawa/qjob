@@ -165,6 +165,7 @@ class TestSubmitJob:
         assert response.json()["status"] == "queued"
 
     def test_directives_are_reflected(self, client, make_script):
+        crud.set_resources(total_cpus=4, gpu_ids=[0])
         script = make_script("""\
             #!/bin/bash
             #QJOB --name my-job --cpus 4 --gpus 1
@@ -513,6 +514,18 @@ class TestUpdateResources:
         admin_client.put("/resources", json={"total_gpus": 4})
         data = admin_client.get("/resources").json()
         assert data["total_gpus"] == 4
+        assert data["gpu_ids"] == [0, 1, 2, 3]
+
+    def test_updates_gpu_ids(self, admin_client):
+        response = admin_client.put("/resources", json={"gpu_ids": [1, 3, 7]})
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total_gpus"] == 3
+        assert data["gpu_ids"] == [1, 3, 7]
+
+    def test_duplicate_gpu_ids_returns_422(self, admin_client):
+        response = admin_client.put("/resources", json={"gpu_ids": [1, 1]})
+        assert response.status_code == 422
 
     def test_updates_mem(self, admin_client):
         admin_client.put("/resources", json={"total_mem_mb": 65536})

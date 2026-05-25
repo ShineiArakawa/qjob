@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import enum
+import json
 import secrets
 
 import sqlalchemy
@@ -270,6 +271,9 @@ class Resource(Base):
     total_gpus: sqlalchemy.orm.Mapped[int] = sqlalchemy.orm.mapped_column(
         sqlalchemy.Integer, nullable=False, default=0
     )
+    gpu_ids: sqlalchemy.orm.Mapped[str] = sqlalchemy.orm.mapped_column(
+        sqlalchemy.Text, nullable=False, default="[]"
+    )
     total_mem_mb: sqlalchemy.orm.Mapped[int] = sqlalchemy.orm.mapped_column(
         sqlalchemy.Integer, nullable=False, default=1024
     )
@@ -303,6 +307,21 @@ class Resource(Base):
     def free_gpus(self) -> int:
         """Number of unallocated GPU devices."""
         return self.total_gpus - self.used_gpus
+
+    @property
+    def configured_gpu_ids(self) -> list[int]:
+        """GPU device IDs managed by qjob."""
+
+        ids = json.loads(self.gpu_ids) if self.gpu_ids else []
+        if ids or self.total_gpus == 0:
+            return list(ids)
+        return list(range(self.total_gpus))
+
+    def set_configured_gpu_ids(self, gpu_ids: list[int]) -> None:
+        """Persist the managed GPU device ID list and derived count."""
+
+        self.gpu_ids = json.dumps(gpu_ids)
+        self.total_gpus = len(gpu_ids)
 
     @property
     def free_mem_mb(self) -> int:

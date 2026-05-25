@@ -150,6 +150,7 @@ class ResourceResponse(pydantic.BaseModel):
     total_gpus:       int
     total_mem_mb:     int
     max_walltime_sec: int | None
+    gpu_ids:          list[int]
     used_cpus:        int
     used_gpus:        int
     used_mem_mb:      int
@@ -173,6 +174,7 @@ class ResourceUpdateRequest(pydantic.BaseModel):
 
     total_cpus:       int | None = pydantic.Field(default=None, gt=0)
     total_gpus:       int | None = pydantic.Field(default=None, ge=0)
+    gpu_ids:          list[int] | None = None
     total_mem_mb:     int | None = pydantic.Field(default=None, gt=0)
     max_walltime_sec: int | None = pydantic.Field(default=None, gt=0)
 
@@ -192,8 +194,16 @@ class ResourceUpdateRequest(pydantic.BaseModel):
             If all fields are None.
         """
 
-        if all(v is None for v in (self.total_cpus, self.total_gpus, self.total_mem_mb, self.max_walltime_sec)):
-            raise ValueError("At least one of total_cpus, total_gpus, total_mem_mb, max_walltime_sec must be set.")
+        if all(v is None for v in (self.total_cpus, self.total_gpus, self.gpu_ids, self.total_mem_mb, self.max_walltime_sec)):
+            raise ValueError("At least one of total_cpus, total_gpus, gpu_ids, total_mem_mb, max_walltime_sec must be set.")
+        if self.gpu_ids is not None:
+            for gpu_id in self.gpu_ids:
+                if isinstance(gpu_id, bool) or gpu_id < 0:
+                    raise ValueError("gpu_ids must contain non-negative integer GPU IDs.")
+            if len(set(self.gpu_ids)) != len(self.gpu_ids):
+                raise ValueError("gpu_ids must not contain duplicates.")
+        if self.total_gpus is not None and self.gpu_ids is not None and self.total_gpus != len(self.gpu_ids):
+            raise ValueError("total_gpus must match the number of gpu_ids when both are set.")
         return self
 
 

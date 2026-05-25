@@ -86,6 +86,28 @@ def _complete_job_id_filtered(
         return []
 
 
+def _parse_gpu_ids(value: str) -> list[int]:
+    """Parse a comma-separated GPU ID list."""
+
+    if not value.strip():
+        return []
+    ids: list[int] = []
+    for raw in value.split(","):
+        part = raw.strip()
+        if not part:
+            raise ValueError("GPU ID list must not contain empty entries.")
+        try:
+            gpu_id = int(part)
+        except ValueError:
+            raise ValueError(f"GPU ID must be an integer, got {part!r}.")
+        if gpu_id < 0:
+            raise ValueError("GPU IDs must be greater than or equal to 0.")
+        ids.append(gpu_id)
+    if len(set(ids)) != len(ids):
+        raise ValueError("GPU IDs must not contain duplicates.")
+    return ids
+
+
 def _complete_job_id(incomplete: str) -> list[str]:
     return _complete_job_id_filtered(incomplete)
 
@@ -503,6 +525,9 @@ def admin_set_resources(
     gpus: typing.Optional[int] = typer.Option(
         None, "--gpus", help="Total number of GPU devices."
     ),
+    gpu_ids: typing.Optional[str] = typer.Option(
+        None, "--gpu-ids", help="Comma-separated managed GPU device IDs, e.g. 0,2,5."
+    ),
     mem: typing.Optional[str] = typer.Option(
         None, "--mem", help="Total memory (e.g. 64G, 512M, 65536)."
     ),
@@ -512,9 +537,9 @@ def admin_set_resources(
 ) -> None:
     """Update the available resource limits."""
 
-    if cpus is None and gpus is None and mem is None and max_walltime is None:
+    if cpus is None and gpus is None and gpu_ids is None and mem is None and max_walltime is None:
         typer.echo(
-            "Error: specify at least one of --cpus, --gpus, --mem, --max-walltime.",
+            "Error: specify at least one of --cpus, --gpus, --gpu-ids, --mem, --max-walltime.",
             err=True,
         )
         raise typer.Exit(code=1)
@@ -538,12 +563,21 @@ def admin_set_resources(
             typer.echo(f"Error: {exc}", err=True)
             raise typer.Exit(code=1)
 
+    parsed_gpu_ids: list[int] | None = None
+    if gpu_ids is not None:
+        try:
+            parsed_gpu_ids = _parse_gpu_ids(gpu_ids)
+        except ValueError as exc:
+            typer.echo(f"Error: {exc}", err=True)
+            raise typer.Exit(code=1)
+
     try:
         info = service.set_resources(
             total_cpus=cpus,
             total_gpus=gpus,
             total_mem_mb=mem_mb,
             max_walltime_sec=max_walltime_sec,
+            gpu_ids=parsed_gpu_ids,
         )
     except ValueError as exc:
         typer.echo(f"Error: {exc}", err=True)
@@ -918,6 +952,8 @@ def _print_resources(info: service.ResourceInfo) -> None:
         f"{'GPUs':<12}  {info.total_gpus:>10}  {info.used_gpus:>8}  "
         f"{info.total_gpus - info.used_gpus:>8}"
     )
+    if info.gpu_ids:
+        typer.echo(f"{'GPU IDs':<12}  {','.join(str(i) for i in info.gpu_ids):>10}")
     typer.echo(
         f"{'Memory(MB)':<12}  {info.total_mem_mb:>10}  {info.used_mem_mb:>8}  "
         f"{info.total_mem_mb - info.used_mem_mb:>8}"
