@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import importlib.metadata
 import os
 import pathlib
@@ -16,6 +17,9 @@ import qjob.core.database as database
 # Constants
 
 _DEFAULT_STATUS_LIMIT = 20
+_MAX_STATUS_LIMIT = 1000
+_JOB_STATES = ["queued", "running", "cancelling", "done", "failed", "cancelled"]
+_JOB_SORT_KEYS = ["submitted", "started", "finished", "priority", "user"]
 
 _SYSTEMD_DIR = pathlib.Path("/etc/systemd/system")
 _SERVER_UNIT = "qjob-server.service"
@@ -69,8 +73,11 @@ def _main(
 
 
 def _complete_status(incomplete: str) -> list[str]:
-    values = ["queued", "running", "cancelling", "done", "failed", "cancelled"]
-    return [v for v in values if v.startswith(incomplete)]
+    return [v for v in _JOB_STATES if v.startswith(incomplete)]
+
+
+def _complete_sort(incomplete: str) -> list[str]:
+    return [v for v in _JOB_SORT_KEYS if v.startswith(incomplete)]
 
 
 def _complete_job_id_filtered(
@@ -107,6 +114,77 @@ def _parse_gpu_ids(value: str) -> list[int]:
     if len(set(ids)) != len(ids):
         raise ValueError("GPU IDs must not contain duplicates.")
     return ids
+
+
+def _parse_states(value: str) -> list[str]:
+    """Parse a comma-separated job state list."""
+
+    if not value.strip():
+        raise ValueError("state filter must not be empty.")
+    states: list[str] = []
+    for raw in value.split(","):
+        state = raw.strip()
+        if not state:
+            raise ValueError("state filter must not contain empty entries.")
+        if state not in _JOB_STATES:
+            raise ValueError(
+                f"Invalid state {state!r}. Valid values: {', '.join(_JOB_STATES)}."
+            )
+        states.append(state)
+    if len(set(states)) != len(states):
+        raise ValueError("state filter must not contain duplicates.")
+    return states
+
+
+def _parse_since(value: str) -> datetime.datetime:
+    """Parse an absolute or relative submitted-at lower bound."""
+
+    raw = value.strip()
+    if not raw:
+        raise ValueError("since filter must not be empty.")
+
+    unit = raw[-1].lower()
+    amount_text = raw[:-1]
+    if unit in ("m", "h", "d") and amount_text:
+        try:
+            amount = float(amount_text)
+        except ValueError:
+            amount = -1
+        if amount <= 0:
+            raise ValueError("relative since filter must be a positive duration.")
+        if unit == "m":
+            delta = datetime.timedelta(minutes=amount)
+        elif unit == "h":
+            delta = datetime.timedelta(hours=amount)
+        else:
+            delta = datetime.timedelta(days=amount)
+        return datetime.datetime.now(datetime.timezone.utc) - delta
+
+    try:
+        if len(raw) == 10:
+            parsed_date = datetime.date.fromisoformat(raw)
+            parsed = datetime.datetime.combine(parsed_date, datetime.time.min)
+        else:
+            parsed = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(
+            "since filter must be a duration like 24h or an ISO date/time."
+        )
+
+    if parsed.tzinfo is None:
+        local_tz = datetime.datetime.now().astimezone().tzinfo
+        parsed = parsed.replace(tzinfo=local_tz)
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+def _parse_sort(value: str) -> str:
+    """Validate a job list sort key."""
+
+    if value not in _JOB_SORT_KEYS:
+        raise ValueError(
+            f"Invalid sort {value!r}. Valid values: {', '.join(_JOB_SORT_KEYS)}."
+        )
+    return value
 
 
 def _complete_job_id(incomplete: str) -> list[str]:
@@ -171,9 +249,35 @@ def status(
         "--all-users",
         help="Show jobs from all users instead of the current user.",
     ),
-    status_filter: typing.Optional[str] = typer.Option(
-        None, "--status", "-s",
-        help="Filter by status: queued, running, done, failed, cancelled.",
+    limit: typing.Optional[int] = typer.Option(
+        None,
+        "--limit",
+        "-n",
+        help=f"Show the latest N matching jobs. Defaults to {_DEFAULT_STATUS_LIMIT}.",
+    ),
+    state_filter: typing.Optional[str] = typer.Option(
+        None, "--state", "-s",
+        help="Filter by state. Comma-separated values are accepted.",
+        autocompletion=_complete_status,
+    ),
+    since_filter: typing.Optional[str] = typer.Option(
+        None,
+        "--since",
+        help=(
+            "Show jobs submitted since a duration or ISO date/time, "
+            "e.g. 24h or 2026-05-01."
+        ),
+    ),
+    sort_key: str = typer.Option(
+        "submitted",
+        "--sort",
+        help="Sort by submitted, started, finished, priority, or user.",
+        autocompletion=_complete_sort,
+    ),
+    status_filter_legacy: typing.Optional[str] = typer.Option(
+        None,
+        "--status",
+        help="Deprecated alias for --state.",
         autocompletion=_complete_status,
     ),
     all_jobs_legacy: bool = typer.Option(
@@ -192,6 +296,41 @@ def status(
         typer.echo("Error: --all-users and --user cannot be combined.", err=True)
         raise typer.Exit(code=1)
 
+    if state_filter is not None and status_filter_legacy is not None:
+        typer.echo("Error: --state and --status cannot be combined.", err=True)
+        raise typer.Exit(code=1)
+
+    show_all = show_all or all_jobs_legacy
+    if show_all and limit is not None:
+        typer.echo("Error: --all and --limit cannot be combined.", err=True)
+        raise typer.Exit(code=1)
+
+    if limit is not None and limit <= 0:
+        typer.echo("Error: --limit must be greater than 0.", err=True)
+        raise typer.Exit(code=1)
+    if limit is not None and limit > _MAX_STATUS_LIMIT:
+        typer.echo(f"Error: --limit must be <= {_MAX_STATUS_LIMIT}.", err=True)
+        raise typer.Exit(code=1)
+
+    state_value = state_filter if state_filter is not None else status_filter_legacy
+    try:
+        states = _parse_states(state_value) if state_value is not None else None
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        since = _parse_since(since_filter) if since_filter is not None else None
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        sort = _parse_sort(sort_key)
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1)
+
     if job_id is not None:
         try:
             info = service.get_job(job_id)
@@ -204,25 +343,30 @@ def status(
         _print_job_detail(info)
         return
 
-    show_all = show_all or all_jobs_legacy
     resolved_user = None if all_users else (user or os.environ.get("USER"))
     try:
         if show_all:
             jobs = service.list_jobs(
                 user=resolved_user,
                 all_users=all_users,
-                status=status_filter,
+                states=states,
+                since=since,
+                sort=sort,
             )
             truncated = False
         else:
+            display_limit = limit or _DEFAULT_STATUS_LIMIT
+            request_limit = min(display_limit + 1, _MAX_STATUS_LIMIT)
             jobs = service.list_jobs(
                 user=resolved_user,
                 all_users=all_users,
-                status=status_filter,
-                limit=_DEFAULT_STATUS_LIMIT + 1,
+                limit=request_limit,
+                states=states,
+                since=since,
+                sort=sort,
             )
-            truncated = len(jobs) > _DEFAULT_STATUS_LIMIT
-            jobs = jobs[:_DEFAULT_STATUS_LIMIT]
+            truncated = len(jobs) > display_limit
+            jobs = jobs[:display_limit]
     except ValueError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1)

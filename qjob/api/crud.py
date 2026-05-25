@@ -21,6 +21,13 @@ DEFAULT_LOG_MAX_BYTES: int = 1024 * 1024
 MAX_LOG_MAX_BYTES:     int = 16 * 1024 * 1024
 DEFAULT_JOB_LIST_LIMIT: int = 100
 MAX_JOB_LIST_LIMIT:     int = 1000
+JOB_LIST_SORT_KEYS: tuple[str, ...] = (
+    "submitted",
+    "started",
+    "finished",
+    "priority",
+    "user",
+)
 
 
 def _normalise_gpu_ids(gpu_ids: list[int]) -> list[int]:
@@ -281,19 +288,27 @@ def get_job(job_id: str) -> JobInfo | None:
 def list_jobs(
     user:   str | None = None,
     status: str | None = None,
+    states: list[str] | None = None,
+    since:  datetime.datetime | None = None,
+    sort:   str = "submitted",
     limit:  int = DEFAULT_JOB_LIST_LIMIT,
     offset: int = 0,
 ) -> JobListPage:
     """
-    Return a list of jobs, optionally filtered by user and/or status.
+    Return a list of jobs, optionally filtered by user and/or state.
 
     Parameters
     ----------
     user : str | None
         When given, only jobs submitted by this user are returned.
     status : str | None
-        When given, only jobs in this status are returned.
-        Must be one of: queued, running, done, failed, cancelled.
+        Legacy single-state filter.  When given, only jobs in this state are returned.
+    states : list[str] | None
+        When given, only jobs in these states are returned.
+    since : datetime.datetime | None
+        When given, only jobs submitted at or after this time are returned.
+    sort : str
+        Sort key: submitted, started, finished, priority, or user.
     limit : int
         Maximum number of jobs to return.
     offset : int
@@ -307,7 +322,7 @@ def list_jobs(
     Raises
     ------
     ValueError
-        If *status*, *limit*, or *offset* is invalid.
+        If *status*, *states*, *since*, *sort*, *limit*, or *offset* is invalid.
     """
 
     if limit <= 0:
@@ -316,24 +331,52 @@ def list_jobs(
         raise ValueError(f"limit must be <= {MAX_JOB_LIST_LIMIT}.")
     if offset < 0:
         raise ValueError("offset must be greater than or equal to 0.")
+    if since is not None and since.tzinfo is None:
+        since = since.replace(tzinfo=datetime.timezone.utc)
+    if sort not in JOB_LIST_SORT_KEYS:
+        raise ValueError(
+            f"Invalid sort {sort!r}. Valid values: {list(JOB_LIST_SORT_KEYS)}"
+        )
 
-    if status is not None:
-        try:
-            status_filter = models.JobStatus(status)
-        except ValueError:
-            valid = [s.value for s in models.JobStatus]
-            raise ValueError(
-                f"Invalid status {status!r}. Valid values: {valid}"
-            )
+    if status is not None and states is not None:
+        raise ValueError("status and states cannot both be specified.")
+
+    requested_states = (
+        states if states is not None else ([status] if status is not None else None)
+    )
+    status_filters: list[models.JobStatus] | None = None
+    if requested_states is not None:
+        if not requested_states:
+            raise ValueError("states must not be empty.")
+        status_filters = []
+        seen: set[models.JobStatus] = set()
+        valid = [s.value for s in models.JobStatus]
+        for state in requested_states:
+            try:
+                status_filter = models.JobStatus(state)
+            except ValueError:
+                raise ValueError(
+                    f"Invalid state {state!r}. Valid values: {valid}"
+                )
+            if status_filter in seen:
+                raise ValueError("states must not contain duplicates.")
+            seen.add(status_filter)
+            status_filters.append(status_filter)
 
     with database.get_session() as session:
         query = session.query(models.Job)
         if user is not None:
             query = query.filter(models.Job.user == user)
-        if status is not None:
-            query = query.filter(models.Job.status == status_filter)
+        if status_filters is not None:
+            query = query.filter(models.Job.status.in_(status_filters))
+        if since is not None:
+            query = query.filter(models.Job.submitted_at >= since)
         total = query.count()
-        query = query.order_by(models.Job.submitted_at.desc()).offset(offset).limit(limit)
+        query = (
+            query.order_by(*_job_list_order_by(sort))
+            .offset(offset)
+            .limit(limit)
+        )
         jobs = query.all()
         return JobListPage(
             jobs=[_job_to_info(j) for j in jobs],
@@ -341,6 +384,30 @@ def list_jobs(
             limit=limit,
             offset=offset,
         )
+
+
+def _job_list_order_by(sort: str) -> tuple[object, ...]:
+    """Return SQLAlchemy order-by clauses for a job list sort key."""
+
+    if sort == "submitted":
+        return (models.Job.submitted_at.desc(),)
+    if sort == "started":
+        return (
+            models.Job.started_at.desc().nullslast(),
+            models.Job.submitted_at.desc(),
+        )
+    if sort == "finished":
+        return (
+            models.Job.finished_at.desc().nullslast(),
+            models.Job.submitted_at.desc(),
+        )
+    if sort == "priority":
+        return (models.Job.priority.desc(), models.Job.submitted_at.desc())
+    if sort == "user":
+        return (models.Job.user.asc(), models.Job.submitted_at.desc())
+    raise ValueError(
+        f"Invalid sort {sort!r}. Valid values: {list(JOB_LIST_SORT_KEYS)}"
+    )
 
 
 def cancel_job(job_id: str, user: str, admin: bool = False) -> JobInfo | None:

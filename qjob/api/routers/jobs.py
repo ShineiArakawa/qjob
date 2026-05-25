@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import typing
 
 import fastapi
@@ -80,7 +81,22 @@ def submit_job(
 def list_jobs(
     user:         typing.Optional[str] = fastapi.Query(None, description="Filter by username."),
     all_users:    bool = fastapi.Query(False, description="Show jobs from all users."),
-    status:       typing.Optional[str] = fastapi.Query(None, description="Filter by status."),
+    state:        typing.Optional[str] = fastapi.Query(
+        None,
+        description="Filter by comma-separated job states.",
+    ),
+    status:       typing.Optional[str] = fastapi.Query(
+        None,
+        description="Deprecated alias for state. Accepts a single job state.",
+    ),
+    since:        typing.Optional[datetime.datetime] = fastapi.Query(
+        None,
+        description="Only include jobs submitted at or after this timestamp.",
+    ),
+    sort:         str = fastapi.Query(
+        "submitted",
+        description="Sort key: submitted, started, finished, priority, or user.",
+    ),
     limit:        int = fastapi.Query(
         crud.DEFAULT_JOB_LIST_LIMIT,
         ge=1,
@@ -91,7 +107,7 @@ def list_jobs(
     current_user: str = fastapi.Depends(auth.get_current_user),
 ) -> schemas.JobListResponse:
     """
-    Return jobs optionally filtered by user and/or status.
+    Return jobs optionally filtered by user and/or state.
 
     Non-admin users see only their own jobs unless *all_users* is True.
     Admins may filter by any user or omit *user* to see all.
@@ -102,8 +118,14 @@ def list_jobs(
         Username filter.  Ignored for non-admin callers when *all_users* is False.
     all_users : bool
         When True, non-admin users may see jobs from all users.
+    state : str | None
+        Comma-separated state filter.
     status : str | None
-        When given, only jobs in this status are returned.
+        Legacy single-state filter.
+    since : datetime.datetime | None
+        Submitted-at lower bound.
+    sort : str
+        Sort key.
     limit : int
         Maximum number of jobs to return.
     offset : int
@@ -120,8 +142,22 @@ def list_jobs(
     if not auth.is_admin(current_user):
         user = None if all_users else current_user
 
+    if state is not None and status is not None:
+        raise fastapi.HTTPException(
+            status_code=400,
+            detail="state and status cannot both be specified.",
+        )
+
     try:
-        page = crud.list_jobs(user=user, status=status, limit=limit, offset=offset)
+        page = crud.list_jobs(
+            user=user,
+            status=status,
+            states=_split_state_filter(state),
+            since=since,
+            sort=sort,
+            limit=limit,
+            offset=offset,
+        )
     except ValueError as exc:
         raise fastapi.HTTPException(status_code=400, detail=str(exc))
 
@@ -131,6 +167,17 @@ def list_jobs(
         limit=page.limit,
         offset=page.offset,
     )
+
+
+def _split_state_filter(value: str | None) -> list[str] | None:
+    """Parse a comma-separated state filter from a query parameter."""
+
+    if value is None:
+        return None
+    states = [part.strip() for part in value.split(",")]
+    if any(not part for part in states):
+        raise ValueError("state must not contain empty entries.")
+    return states
 
 
 # --------------------------------------------------------------------------------------

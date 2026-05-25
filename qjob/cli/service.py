@@ -218,6 +218,9 @@ def list_jobs(
     status:    str | None = None,
     limit:     int | None = None,
     offset:    int = 0,
+    states:    list[str] | None = None,
+    since:     datetime.datetime | None = None,
+    sort:      str = "submitted",
 ) -> list[JobInfo]:
     """
     Return a list of jobs, optionally filtered by user and/or status.
@@ -229,7 +232,13 @@ def list_jobs(
     all_users : bool
         When True, request jobs from all users (subject to server-side auth).
     status : str | None
-        When given, only jobs in this status are returned.
+        Legacy single-state filter.  When given, only jobs in this state are returned.
+    states : list[str] | None
+        When given, only jobs in these states are returned.
+    since : datetime.datetime | None
+        When given, only jobs submitted at or after this time are returned.
+    sort : str
+        Sort key: submitted, started, finished, priority, or user.
     limit : int | None
         Maximum number of jobs to return.  When None, all matching jobs are
         fetched page by page.
@@ -244,10 +253,15 @@ def list_jobs(
     Raises
     ------
     ValueError
-        If *status* is not a valid ``JobStatus`` value.
+        If *status* or *states* contains an invalid ``JobStatus`` value.
     """
 
-    return _run(_async_list_jobs(user, all_users, status, limit, offset))
+    if status is not None and states is not None:
+        raise ValueError("status and states cannot both be specified.")
+
+    return _run(
+        _async_list_jobs(user, all_users, status, limit, offset, states, since, sort)
+    )
 
 
 def cancel_job(job_id: str) -> JobInfo | None:
@@ -415,6 +429,9 @@ async def _async_list_jobs(
     status:    str | None,
     limit:     int | None,
     offset:    int,
+    states:    list[str] | None,
+    since:     datetime.datetime | None,
+    sort:      str,
 ) -> list[JobInfo]:
     """Async implementation of list_jobs."""
 
@@ -425,6 +442,9 @@ async def _async_list_jobs(
                 user=user,
                 all_users=all_users,
                 status=status,
+                states=states,
+                since=since,
+                sort=sort,
                 limit=limit,
                 offset=offset,
             )
@@ -439,6 +459,9 @@ async def _async_list_jobs(
                 user=user,
                 all_users=all_users,
                 status=status,
+                states=states,
+                since=since,
+                sort=sort,
                 limit=page_size,
                 offset=next_offset,
             )
@@ -454,6 +477,9 @@ async def _fetch_jobs_page(
     user:      str | None,
     all_users: bool,
     status:    str | None,
+    states:    list[str] | None,
+    since:     datetime.datetime | None,
+    sort:      str,
     limit:     int,
     offset:    int,
 ) -> dict:
@@ -462,11 +488,16 @@ async def _fetch_jobs_page(
     params: dict[str, str] = {
         "limit": str(limit),
         "offset": str(offset),
+        "sort": sort,
     }
     if user is not None:
         params["user"] = user
     if all_users:
         params["all_users"] = "true"
+    if states is not None:
+        params["state"] = ",".join(states)
+    if since is not None:
+        params["since"] = since.isoformat()
     if status is not None:
         params["status"] = status
 

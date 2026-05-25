@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import pathlib
@@ -111,6 +112,9 @@ def _persist_job(
     req_gpus:  int = 0,
     priority:  int = 50,
     name:      str | None = "test-job",
+    submitted_at: datetime.datetime | None = None,
+    started_at: datetime.datetime | None = None,
+    finished_at: datetime.datetime | None = None,
 ) -> models.Job:
     """Insert a job row directly into the DB and return the instance."""
 
@@ -124,6 +128,12 @@ def _persist_job(
         req_mem_mb=512,
         priority=priority,
     )
+    if submitted_at is not None:
+        job.submitted_at = submitted_at
+    if started_at is not None:
+        job.started_at = started_at
+    if finished_at is not None:
+        job.finished_at = finished_at
     with database.get_session() as session:
         session.add(job)
     return job
@@ -245,8 +255,72 @@ class TestListJobs:
         data = client.get("/jobs", params={"status": "queued"}).json()
         assert all(j["status"] == "queued" for j in data["jobs"])
 
+    def test_filter_by_state(self, client):
+        _persist_job(status=models.JobStatus.QUEUED)
+        _persist_job(status=models.JobStatus.DONE)
+        data = client.get("/jobs", params={"state": "queued"}).json()
+        assert all(j["status"] == "queued" for j in data["jobs"])
+
+    def test_filter_by_multiple_states(self, client):
+        _persist_job(status=models.JobStatus.QUEUED)
+        _persist_job(status=models.JobStatus.RUNNING)
+        _persist_job(status=models.JobStatus.DONE)
+
+        data = client.get("/jobs", params={"state": "queued,running"}).json()
+
+        assert data["total"] == 2
+        assert {j["status"] for j in data["jobs"]} == {"queued", "running"}
+
     def test_invalid_status_returns_400(self, client):
         response = client.get("/jobs", params={"status": "invalid"})
+        assert response.status_code == 400
+
+    def test_invalid_state_returns_400(self, client):
+        response = client.get("/jobs", params={"state": "invalid"})
+        assert response.status_code == 400
+
+    def test_status_and_state_returns_400(self, client):
+        response = client.get(
+            "/jobs",
+            params={"status": "queued", "state": "running"},
+        )
+        assert response.status_code == 400
+
+    def test_filter_by_since(self, client):
+        cutoff = datetime.datetime(2026, 5, 1, tzinfo=datetime.timezone.utc)
+        _persist_job(
+            name="old",
+            submitted_at=cutoff - datetime.timedelta(days=1),
+        )
+        _persist_job(
+            name="new",
+            submitted_at=cutoff + datetime.timedelta(hours=1),
+        )
+
+        data = client.get("/jobs", params={"since": cutoff.isoformat()}).json()
+
+        assert data["total"] == 1
+        assert data["jobs"][0]["name"] == "new"
+
+    def test_sort_by_priority(self, client):
+        _persist_job(name="low", priority=10)
+        _persist_job(name="high", priority=90)
+
+        data = client.get("/jobs", params={"sort": "priority"}).json()
+
+        assert [j["name"] for j in data["jobs"]] == ["high", "low"]
+
+    def test_sort_by_user(self, admin_client):
+        now = datetime.datetime(2026, 5, 1, tzinfo=datetime.timezone.utc)
+        _persist_job(user="bob", name="bob-job", submitted_at=now)
+        _persist_job(user="alice", name="alice-job", submitted_at=now)
+
+        data = admin_client.get("/jobs", params={"sort": "user"}).json()
+
+        assert [j["user"] for j in data["jobs"]] == ["alice", "bob"]
+
+    def test_invalid_sort_returns_400(self, client):
+        response = client.get("/jobs", params={"sort": "invalid"})
         assert response.status_code == 400
 
     def test_total_matches_jobs_length(self, client):
@@ -620,6 +694,40 @@ class TestServiceHttpClient:
         assert len(jobs) == 1
         assert jobs[0].user == "alice"
         assert jobs[0].status == "queued"
+
+    def test_list_jobs_filters_by_states(self):
+        _persist_job(user="alice", status=models.JobStatus.QUEUED)
+        _persist_job(user="alice", status=models.JobStatus.DONE)
+
+        jobs = service.list_jobs(states=["queued"])
+
+        assert len(jobs) == 1
+        assert jobs[0].status == "queued"
+
+    def test_list_jobs_filters_by_since(self):
+        cutoff = datetime.datetime(2026, 5, 1, tzinfo=datetime.timezone.utc)
+        _persist_job(
+            user="alice",
+            status=models.JobStatus.QUEUED,
+            submitted_at=cutoff - datetime.timedelta(days=1),
+        )
+        _persist_job(
+            user="alice",
+            status=models.JobStatus.QUEUED,
+            submitted_at=cutoff + datetime.timedelta(hours=1),
+        )
+
+        jobs = service.list_jobs(since=cutoff)
+
+        assert len(jobs) == 1
+
+    def test_list_jobs_sorts_by_priority(self):
+        _persist_job(user="alice", name="low", priority=10)
+        _persist_job(user="alice", name="high", priority=90)
+
+        jobs = service.list_jobs(sort="priority")
+
+        assert [j.name for j in jobs] == ["high", "low"]
 
     def test_get_job_returns_none_for_404(self):
         result = service.get_job("00000000-0000-0000-0000-000000000000")

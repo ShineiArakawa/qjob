@@ -272,11 +272,16 @@ The CLI validates the script locally and then sends its absolute path and the cu
 ```bash
 qjob status
 qjob status <job_id>
-qjob status --status running
+qjob status --state running
+qjob status --state queued,running
+qjob status --since 24h
+qjob status --since 2026-05-01
+qjob status --limit 50
+qjob status --sort priority
 qjob status --all
 ```
 
-By default, `qjob status` lists the latest 20 jobs for the current OS user. Use `--all` to fetch all matching jobs for the current user.
+By default, `qjob status` lists the latest 20 jobs for the current OS user sorted by submission time. Use `--since` to show jobs submitted after a relative duration (`24h`, `7d`) or ISO date/time, `--limit N` to show a different number of recent jobs, `--sort submitted|started|finished|priority|user` to change ordering, or `--all` to fetch all matching jobs for the current user.
 
 Additional filters:
 
