@@ -246,6 +246,8 @@ taskset -c <cpu-list> bash <script_path>
 
 The working directory is the submitter's current directory as sent by the CLI. If no working directory is supplied to the API, qjob uses the script's parent directory.
 
+Because the script is run as `bash <script_path>` — neither a login nor an interactive shell — no `/etc/profile`, `~/.profile` or `~/.bashrc` is read by the job itself. The environment qjob builds is therefore the complete environment the script sees.
+
 The following variables are injected into the job environment:
 
 | Variable | Value |
@@ -254,8 +256,26 @@ The following variables are injected into the job environment:
 | `QJOB_JOB_NAME` | Job name. |
 | `QJOB_USER` | Submitting username. |
 | `CUDA_VISIBLE_DEVICES` | Comma-separated assigned GPU device IDs, or an empty string for CPU-only jobs. |
+| `HOME` | Home directory of the submitting user, from the password database. |
+| `USER`, `LOGNAME` | Submitting username. |
+| `SHELL` | Login shell of the submitting user. |
+| `PATH` | The submitting user's login PATH (see below), not the minimal PATH systemd gives the scheduler. |
 
-The runner begins from the scheduler process environment. Therefore, environment variables available to the scheduler may also be visible to jobs unless explicitly controlled by deployment policy.
+`PATH` is resolved per user, in this order, and cached for the lifetime of the scheduler process:
+
+1. `QJOB_JOB_PATH` from the scheduler environment, when set. Use it to pin one PATH for every job.
+2. The user's own login shell, probed once with `runuser -l <user> -c ...` (or `su -l`, or the shell directly when the scheduler is not root). This applies `/etc/profile` and `~/.profile`, so conda, pyenv and `~/.local/bin` entries are picked up.
+3. `ENV_PATH` (`ENV_SUPATH` for root) from `/etc/login.defs`.
+4. A built-in fallback, `/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin`.
+
+`~/.local/bin` and `~/bin` are prepended when they exist and are not already present.
+
+The runner otherwise begins from the scheduler process environment, so variables set in the unit file (or in `--env-file`) reach jobs. Variables that describe the scheduler itself are removed first, because inheriting them breaks or leaks into jobs:
+
+- systemd service state: `INVOCATION_ID`, `JOURNAL_STREAM`, `NOTIFY_SOCKET`, `LISTEN_*`, `WATCHDOG_*`, `*_DIRECTORY`.
+- The session that started the scheduler: `XDG_*`, `DBUS_SESSION_BUS_ADDRESS`, `SSH_*`, `SUDO_*`, `MAIL`, `PWD`, `OLDPWD`.
+- The scheduler's own Python interpreter: `VIRTUAL_ENV`, `PYTHONPATH`, `PYTHONHOME`, `CONDA_*`, `LD_PRELOAD`. Left in place, these hijack `python` inside every job.
+- Scheduler configuration and credentials: `QJOB_DB_URL`, `QJOB_DB_POOL_*`, `QJOB_ADMIN_USERS`, `QJOB_TOKEN_PATH`, `QJOB_JOB_PATH`.
 
 ## Command Line Usage
 
@@ -407,6 +427,7 @@ curl -H "Authorization: Bearer $(cat ~/.config/qjob/token)" \
 | `QJOB_API_URL` | Base URL used by the CLI. | `http://127.0.0.1:8000` |
 | `QJOB_TOKEN_PATH` | Path to the local API token file. | `~/.config/qjob/token` |
 | `QJOB_ADMIN_USERS` | Comma-separated admin usernames. | `root` |
+| `QJOB_JOB_PATH` | PATH given to every job, bypassing the per-user login-shell probe. | none |
 | `QJOB_DB_POOL_ENABLED` | Enable SQLAlchemy connection pooling. | `false` |
 | `QJOB_DB_POOL_SIZE` | Pool size when pooling is enabled. | `5` |
 | `QJOB_DB_MAX_OVERFLOW` | Maximum overflow connections when pooling is enabled. | `5` |

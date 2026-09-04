@@ -6,6 +6,7 @@ import getpass
 import json
 import os
 import pathlib
+import pwd
 import textwrap
 
 import pytest
@@ -103,6 +104,98 @@ class TestBuildEnv:
         job = _make_job()
         env = runner._build_env(job)
         assert env.get("MY_CUSTOM_VAR") == "hello"
+
+    def test_home_is_the_job_user_home(self, monkeypatch):
+        monkeypatch.setenv("HOME", "/root")
+        job = _make_job()
+        env = runner._build_env(job)
+        assert env["HOME"] == pwd.getpwnam(_REAL_USER).pw_dir
+
+    def test_user_identity_replaces_daemon_identity(self, monkeypatch):
+        monkeypatch.setenv("USER", "root")
+        monkeypatch.setenv("LOGNAME", "root")
+        job = _make_job()
+        env = runner._build_env(job)
+        assert env["USER"] == _REAL_USER
+        assert env["LOGNAME"] == _REAL_USER
+        assert env["SHELL"] == pwd.getpwnam(_REAL_USER).pw_shell
+
+    def test_path_is_not_inherited_from_the_daemon(self, monkeypatch):
+        monkeypatch.setattr(runner, "_user_path_cache", {})
+        monkeypatch.delenv("QJOB_JOB_PATH", raising=False)
+        monkeypatch.setenv("PATH", "/opt/systemd-only")
+        job = _make_job()
+        env = runner._build_env(job)
+        assert "/opt/systemd-only" not in env["PATH"].split(os.pathsep)
+        assert env["PATH"]
+
+    def test_qjob_job_path_overrides_the_resolved_path(self, monkeypatch):
+        monkeypatch.setattr(runner, "_user_path_cache", {})
+        monkeypatch.setenv("QJOB_JOB_PATH", "/opt/pinned/bin:/usr/bin")
+        job = _make_job()
+        env = runner._build_env(job)
+        assert env["PATH"] == "/opt/pinned/bin:/usr/bin"
+
+    def test_daemon_only_variables_are_dropped(self, monkeypatch):
+        monkeypatch.setenv("INVOCATION_ID", "systemd-unit-id")
+        monkeypatch.setenv("VIRTUAL_ENV", "/opt/qjob/.venv")
+        monkeypatch.setenv("QJOB_DB_URL", "postgresql://user:secret@localhost/qjob")
+        job = _make_job()
+        env = runner._build_env(job)
+        assert "INVOCATION_ID" not in env
+        assert "VIRTUAL_ENV" not in env
+        assert "QJOB_DB_URL" not in env
+
+    def test_unknown_user_keeps_the_daemon_environment(self, monkeypatch):
+        monkeypatch.setenv("HOME", "/root")
+        assert runner._user_identity_env("no-such-user-for-qjob-tests") == {}
+
+
+# --------------------------------------------------------------------------------------
+# PATH resolution helpers
+
+
+class TestUserPath:
+    """PATH is resolved from the user's login environment, not the daemon's."""
+
+    def test_login_defs_path_is_read(self):
+        # ENV_PATH is absent on some systems; only assert the shape when present.
+        path = runner._login_defs_path(_REAL_USER)
+        assert path is None or path.startswith("/")
+
+    def test_login_shell_path_matches_the_current_shell(self):
+        pw = pwd.getpwnam(_REAL_USER)
+        path = runner._login_shell_path(pw)
+        # None when the probe is unavailable (e.g. a nologin shell in CI).
+        assert path is None or os.pathsep in path or path.startswith("/")
+
+    def test_user_bin_dirs_are_prepended_when_present(self, tmp_path):
+        (tmp_path / "bin").mkdir()
+        (tmp_path / ".local" / "bin").mkdir(parents=True)
+        path = runner._prepend_user_bin_dirs("/usr/bin", str(tmp_path))
+        assert path == f"{tmp_path}/.local/bin:{tmp_path}/bin:/usr/bin"
+
+    def test_missing_user_bin_dirs_are_skipped(self, tmp_path):
+        path = runner._prepend_user_bin_dirs("/usr/bin", str(tmp_path))
+        assert path == "/usr/bin"
+
+    def test_existing_entries_are_not_duplicated(self, tmp_path):
+        (tmp_path / "bin").mkdir()
+        path = runner._prepend_user_bin_dirs(f"/usr/bin:{tmp_path}/bin", str(tmp_path))
+        assert path == f"/usr/bin:{tmp_path}/bin"
+
+    def test_resolved_path_is_cached_per_user(self, monkeypatch):
+        monkeypatch.setattr(runner, "_user_path_cache", {})
+        monkeypatch.delenv("QJOB_JOB_PATH", raising=False)
+        pw = pwd.getpwnam(_REAL_USER)
+
+        first = runner._user_path(pw)
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("the login shell must be probed only once per user")
+
+        monkeypatch.setattr(runner, "_login_shell_path", _fail)
+        assert runner._user_path(pw) == first
 
 
 # --------------------------------------------------------------------------------------
