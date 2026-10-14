@@ -87,7 +87,7 @@ def _make_running_job(
     req_gpus:     int = 0,
     req_mem_mb:   int = 512,
     walltime_sec: int | None = 3600,
-    started_seconds_ago: int = 0,
+    started_seconds_ago: int | None = 0,
     gpu_ids:      list[int] | None = None,
     cpu_ids:      list[int] | None = None,
     status:       models.JobStatus = models.JobStatus.RUNNING,
@@ -100,6 +100,9 @@ def _make_running_job(
 
     Parameters
     ----------
+    started_seconds_ago : int | None
+        Seconds since ``started_at``.  None leaves ``started_at`` unset, as for
+        a job whose runner has not called ``_mark_running()`` yet.
     gpu_ids : list[int] | None
         GPU IDs the job holds.  None means ``range(req_gpus)``.
     cpu_ids : list[int] | None
@@ -108,9 +111,11 @@ def _make_running_job(
         Stored status, e.g. CANCELLING for a job that still holds its GPUs.
     """
 
-    started = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
-        seconds=started_seconds_ago
-    )
+    started = None
+    if started_seconds_ago is not None:
+        started = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+            seconds=started_seconds_ago
+        )
     job = models.Job(
         user="alice",
         script_path="/tmp/job.sh",
@@ -352,6 +357,49 @@ class TestEstimateReservationWindow:
         # Both jobs must finish for head to get 2 CPUs → window ≈ 2000s.
         assert result is not None
         assert 1990 <= result <= 2010
+
+    def test_cancelling_job_counts_as_immediate_release(self):
+        """
+        A CANCELLING job is being terminated, so its resources count as free at
+        once, although it has no walltime.  Both GPUs are held, so the head can
+        start as soon as that job is gone.
+        """
+        _configure_resources(
+            cpus=16, mem_mb=65536, gpu_ids=[0, 1],
+            used_cpus=1, used_gpus=2, used_mem_mb=512,
+        )
+        _make_running_job(
+            req_gpus=2, gpu_ids=[0, 1], walltime_sec=None,
+            status=models.JobStatus.CANCELLING,
+        )
+        head = _make_queued_job(req_gpus=2)
+
+        sched = _make_scheduler()
+        with database.get_session() as session:
+            result = sched._estimate_reservation_window(session, head)
+
+        assert result == 0.0
+
+    def test_unstarted_running_job_counts_with_full_walltime(self):
+        """
+        A RUNNING job whose ``started_at`` is not set yet has just been
+        launched (``_mark_running()`` sets it after the spawn), so it releases
+        its GPUs after its whole walltime.
+        """
+        _configure_resources(
+            cpus=16, mem_mb=65536, gpu_ids=[0, 1],
+            used_cpus=1, used_gpus=2, used_mem_mb=512,
+        )
+        _make_running_job(
+            req_gpus=2, gpu_ids=[0, 1], walltime_sec=600, started_seconds_ago=None,
+        )
+        head = _make_queued_job(req_gpus=2)
+
+        sched = _make_scheduler()
+        with database.get_session() as session:
+            result = sched._estimate_reservation_window(session, head)
+
+        assert result == 600.0
 
 
 # --------------------------------------------------------------------------------------
@@ -823,6 +871,35 @@ class TestContiguousGpuAllocation:
         assert _placement(head) == (models.JobStatus.QUEUED, None)
         assert _placement(backfill_a) == (models.JobStatus.RUNNING, [2, 3])
         assert _placement(backfill_b) == (models.JobStatus.RUNNING, [4, 5])
+
+    def test_same_tick_launch_shortens_the_backfill_window(self, monkeypatch):
+        """
+        A job launched earlier in the tick is still QUEUED in the DB (the session
+        does not autoflush), yet it is a release the head's window must count.
+
+        Layout: GPUs 0-5 with [1] busy (X, walltime 1000s).  J (100s) takes
+        [2, 3].  H needs 3 consecutive IDs but only 0, 4 and 5 are free, so it
+        is blocked by contiguity although the counters fit.  Its window is J's
+        100s, not X's 1000s: when J ends, H can take [2, 3, 4].  B (800s) would
+        still hold [4, 5] then and delay H, so it must not be backfilled.
+        """
+        launched = _patch_start_job(monkeypatch)
+        _configure_resources(
+            cpus=16, mem_mb=65536, gpu_ids=list(range(6)),
+            used_cpus=1, used_gpus=1, used_mem_mb=512,
+        )
+        _make_running_job(req_gpus=1, gpu_ids=[1], walltime_sec=1000)
+        j = _make_queued_job(req_gpus=2, priority=90, walltime_sec=100)
+        h = _make_queued_job(req_gpus=3, priority=80)
+        b = _make_queued_job(req_gpus=2, priority=70, walltime_sec=800)
+
+        sched = _make_scheduler(max_workers=10)
+        asyncio.run(sched._tick())
+
+        assert launched == [j.id]
+        assert _placement(j) == (models.JobStatus.RUNNING, [2, 3])
+        assert _placement(h) == (models.JobStatus.QUEUED, None)
+        assert _placement(b) == (models.JobStatus.QUEUED, None)
 
 
 # --------------------------------------------------------------------------------------

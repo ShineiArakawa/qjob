@@ -626,11 +626,15 @@ class Scheduler:
         Jobs without a walltime are ignored — their finish time cannot be
         predicted.
 
-        Only the CPU, GPU and memory counts are simulated.  The requirement
-        that a multi-GPU job gets consecutive GPU IDs is not modelled, so the
-        estimate is a lower bound on the head job's true start time.  Backfill
-        therefore errs on the conservative side: it never uses a window that is
-        longer than the real one.
+        Only the CPU, GPU and memory counts are simulated.  Ignoring the
+        requirement that a multi-GPU job gets consecutive GPU IDs can only make
+        the estimate earlier than the true start.  Jobs launched earlier in the
+        same tick, jobs not yet marked started and CANCELLING jobs are counted
+        as releases: CANCELLING jobs release at once, the other two after their
+        walltime.  Assuming every job with a walltime ends exactly at it, the
+        estimate is therefore a lower bound on the head's start, so EASY
+        backfill does not delay the head.  RUNNING jobs without a walltime are
+        assumed never to end.
 
         Parameters
         ----------
@@ -648,25 +652,38 @@ class Scheduler:
 
         import datetime
 
+        # Sessions do not autoflush; show jobs launched earlier in this tick as RUNNING.
+        session.flush()
+
         now = datetime.datetime.now(datetime.timezone.utc)
 
         running_jobs = (
             session.query(models.Job)
-            .filter(models.Job.status == models.JobStatus.RUNNING)
+            .filter(models.Job.status.in_([
+                models.JobStatus.RUNNING,
+                models.JobStatus.CANCELLING,
+            ]))
             .all()
         )
 
-        # Build a list of (finish_time_sec_from_now, cpus, gpus, mem_mb)
-        # for every running job that has a walltime.
+        # Build a list of (finish_time_sec_from_now, cpus, gpus, mem_mb) for every
+        # CANCELLING job and every running job that has a walltime.
         finish_events: list[tuple[float, int, int, int]] = []
         for rj in running_jobs:
-            if rj.walltime_sec is None or rj.started_at is None:
+            if rj.status == models.JobStatus.CANCELLING:
+                # Being terminated, so its resources come back at once.
+                remaining = 0.0
+            elif rj.walltime_sec is None:
                 continue
-            started = rj.started_at
-            if started.tzinfo is None:
-                started = started.replace(tzinfo=datetime.timezone.utc)
-            remaining = rj.walltime_sec - (now - started).total_seconds()
-            remaining = max(0.0, remaining)
+            elif rj.started_at is None:
+                # Just launched; _mark_running() has not set started_at yet.
+                remaining = float(rj.walltime_sec)
+            else:
+                started = rj.started_at
+                if started.tzinfo is None:
+                    started = started.replace(tzinfo=datetime.timezone.utc)
+                remaining = rj.walltime_sec - (now - started).total_seconds()
+                remaining = max(0.0, remaining)
             cpu_ids: list[int] = json.loads(rj.assigned_cpus) if rj.assigned_cpus else []
             gpu_ids: list[int] = json.loads(rj.assigned_gpus) if rj.assigned_gpus else []
             finish_events.append((remaining, len(cpu_ids), len(gpu_ids), rj.req_mem_mb))
