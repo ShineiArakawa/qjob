@@ -127,6 +127,11 @@ class ResourceInfo:
         GPU devices currently allocated to running jobs.
     used_mem_mb : int
         Memory currently allocated to running jobs in megabytes.
+    free_gpu_ids : list[int]
+        Configured GPU IDs that no running or cancelling job holds, ascending.
+    max_contiguous_free_gpus : int
+        Length of the longest run of consecutive IDs in ``free_gpu_ids``
+        (0 when no GPU is free).
     """
 
     total_cpus:       int
@@ -137,6 +142,9 @@ class ResourceInfo:
     used_gpus:        int
     used_mem_mb:      int
     gpu_ids:          list[int] = dataclasses.field(default_factory=list)
+
+    free_gpu_ids:             list[int] = dataclasses.field(default_factory=list)
+    max_contiguous_free_gpus: int = 0
 
 
 @dataclasses.dataclass
@@ -550,7 +558,9 @@ def get_resources() -> ResourceInfo:
     Return the current resource configuration and usage summary.
 
     Usage counts are read from the ``resources`` table which is kept
-    up-to-date by the scheduler via atomic DB transactions.
+    up-to-date by the scheduler via atomic DB transactions.  The free GPU IDs
+    are derived from the GPUs held by RUNNING and CANCELLING jobs, which is
+    the occupancy the scheduler places jobs against.
 
     Parameters
     ----------
@@ -559,7 +569,8 @@ def get_resources() -> ResourceInfo:
     Returns
     -------
     ResourceInfo
-        Total and used resource counts.
+        Total and used resource counts, the free GPU IDs, and the length of
+        the longest run of consecutive free GPU IDs.
     """
 
     with database.get_session() as session:
@@ -573,12 +584,15 @@ def get_resources() -> ResourceInfo:
             )
 
         gpu_ids = row.configured_gpu_ids
+        free_ids = _free_gpu_ids(session, gpu_ids)
         return ResourceInfo(
             total_cpus=row.total_cpus,
             total_gpus=len(gpu_ids),
             total_mem_mb=row.total_mem_mb,
             max_walltime_sec=row.max_walltime_sec,
             gpu_ids=gpu_ids,
+            free_gpu_ids=free_ids,
+            max_contiguous_free_gpus=gpu_blocks.max_contiguous_run(free_ids),
             used_cpus=row.used_cpus,
             used_gpus=row.used_gpus,
             used_mem_mb=row.used_mem_mb,
@@ -654,12 +668,15 @@ def set_resources(
         row.updated_at = datetime.datetime.now(datetime.timezone.utc)
 
         current_gpu_ids = row.configured_gpu_ids
+        free_ids = _free_gpu_ids(session, current_gpu_ids)
         return ResourceInfo(
             total_cpus=row.total_cpus,
             total_gpus=len(current_gpu_ids),
             total_mem_mb=row.total_mem_mb,
             max_walltime_sec=row.max_walltime_sec,
             gpu_ids=current_gpu_ids,
+            free_gpu_ids=free_ids,
+            max_contiguous_free_gpus=gpu_blocks.max_contiguous_run(free_ids),
             used_cpus=row.used_cpus,
             used_gpus=row.used_gpus,
             used_mem_mb=row.used_mem_mb,
@@ -786,3 +803,44 @@ def _compute_usage(
         used_mem_mb += job.req_mem_mb
 
     return used_cpus, used_gpus, used_mem_mb
+
+
+def _free_gpu_ids(
+    session:            sqlalchemy.orm.Session,
+    configured_gpu_ids: list[int],
+) -> list[int]:
+    """
+    Return the configured GPU IDs that no RUNNING or CANCELLING job holds.
+
+    This applies the same occupancy rule as ``Scheduler._free_gpu_ids`` but is
+    kept here on purpose: importing the scheduler would pull the runner into
+    the API process.
+
+    Parameters
+    ----------
+    session : sqlalchemy.orm.Session
+        An open DB session.
+    configured_gpu_ids : list[int]
+        GPU IDs managed by qjob.
+
+    Returns
+    -------
+    list[int]
+        The free GPU IDs in ascending order.
+    """
+
+    holders: list[models.Job] = (
+        session.query(models.Job)
+        .filter(models.Job.status.in_([
+            models.JobStatus.RUNNING,
+            models.JobStatus.CANCELLING,
+        ]))
+        .all()
+    )
+
+    occupied: set[int] = set()
+    for job in holders:
+        if job.assigned_gpus:
+            occupied.update(json.loads(job.assigned_gpus))
+
+    return sorted(set(configured_gpu_ids) - occupied)

@@ -147,6 +147,11 @@ class ResourceResponse(pydantic.BaseModel):
         GPU devices currently allocated to running jobs.
     used_mem_mb : int
         Memory currently allocated to running jobs in megabytes.
+    free_gpu_ids : list[int]
+        Configured GPU IDs that no running or cancelling job holds, ascending.
+    max_contiguous_free_gpus : int
+        Length of the longest run of consecutive IDs in ``free_gpu_ids``
+        (0 when no GPU is free).
     """
 
     total_cpus:       int
@@ -157,6 +162,9 @@ class ResourceResponse(pydantic.BaseModel):
     used_cpus:        int
     used_gpus:        int
     used_mem_mb:      int
+
+    free_gpu_ids:             list[int] = pydantic.Field(default_factory=list)
+    max_contiguous_free_gpus: int = 0
 
 
 class ResourceUpdateRequest(pydantic.BaseModel):

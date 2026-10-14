@@ -1126,6 +1126,14 @@ def _print_resources(info: service.ResourceInfo) -> None:
     )
     if info.gpu_ids:
         typer.echo(f"{'GPU IDs':<12}  {','.join(str(i) for i in info.gpu_ids):>10}")
+    if info.free_gpu_ids is not None:
+        free_ids = ",".join(str(i) for i in info.free_gpu_ids) or "—"
+        typer.echo(f"{'Free GPU IDs':<12}  {free_ids:>10}")
+    if info.max_contiguous_free_gpus is not None:
+        typer.echo(
+            f"{'GPU block':<12}  {info.max_contiguous_free_gpus:>10}  "
+            "(largest run of consecutive free GPU IDs)"
+        )
     typer.echo(
         f"{'Memory(MB)':<12}  {info.total_mem_mb:>10}  {info.used_mem_mb:>8}  "
         f"{info.total_mem_mb - info.used_mem_mb:>8}"

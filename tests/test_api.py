@@ -115,6 +115,7 @@ def _persist_job(
     submitted_at: datetime.datetime | None = None,
     started_at: datetime.datetime | None = None,
     finished_at: datetime.datetime | None = None,
+    assigned_gpus: list[int] | None = None,
 ) -> models.Job:
     """Insert a job row directly into the DB and return the instance."""
 
@@ -128,6 +129,8 @@ def _persist_job(
         req_mem_mb=512,
         priority=priority,
     )
+    if assigned_gpus is not None:
+        job.assigned_gpus = json.dumps(assigned_gpus)
     if submitted_at is not None:
         job.submitted_at = submitted_at
     if started_at is not None:
@@ -656,6 +659,61 @@ class TestGetResources:
         data = client.get("/resources").json()
         assert data["used_cpus"] == 4
 
+    def test_free_gpu_ids_exclude_running_and_cancelling_jobs(self, client):
+        crud.set_resources(gpu_ids=[0, 1, 2, 3])
+        _persist_job(status=models.JobStatus.RUNNING, req_gpus=1, assigned_gpus=[1])
+        _persist_job(status=models.JobStatus.CANCELLING, req_gpus=1, assigned_gpus=[3])
+
+        data = client.get("/resources").json()
+
+        assert data["free_gpu_ids"] == [0, 2]
+        assert data["max_contiguous_free_gpus"] == 1
+
+    def test_free_gpu_ids_without_jobs(self, client):
+        crud.set_resources(gpu_ids=[0, 1, 2, 3])
+
+        data = client.get("/resources").json()
+
+        assert data["free_gpu_ids"] == [0, 1, 2, 3]
+        assert data["max_contiguous_free_gpus"] == 4
+
+    def test_free_gpu_ids_ignore_jobs_that_do_not_hold_gpus(self, client):
+        # Only RUNNING and CANCELLING jobs occupy GPUs, so a stale assigned_gpus
+        # on a job in any other state must not hide a free GPU.
+        crud.set_resources(gpu_ids=[0, 1, 2, 3])
+        for status in (
+            models.JobStatus.QUEUED,
+            models.JobStatus.DONE,
+            models.JobStatus.FAILED,
+            models.JobStatus.CANCELLED,
+        ):
+            _persist_job(status=status, req_gpus=4, assigned_gpus=[0, 1, 2, 3])
+
+        data = client.get("/resources").json()
+
+        assert data["free_gpu_ids"] == [0, 1, 2, 3]
+        assert data["max_contiguous_free_gpus"] == 4
+
+    def test_no_free_gpu_ids_when_every_gpu_is_held(self, client):
+        crud.set_resources(gpu_ids=[0, 1])
+        _persist_job(status=models.JobStatus.RUNNING, req_gpus=2, assigned_gpus=[0, 1])
+
+        data = client.get("/resources").json()
+
+        assert data["free_gpu_ids"] == []
+        assert data["max_contiguous_free_gpus"] == 0
+
+    def test_free_gpu_fields_default_when_resource_row_is_missing(self, client):
+        with database.get_session() as session:
+            session.query(models.Resource).delete()
+
+        response = client.get("/resources")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["free_gpu_ids"] == []
+        assert data["max_contiguous_free_gpus"] == 0
+
 
 # --------------------------------------------------------------------------------------
 # PUT /resources
@@ -689,6 +747,32 @@ class TestUpdateResources:
         data = response.json()
         assert data["total_gpus"] == 3
         assert data["gpu_ids"] == [1, 3, 7]
+
+    def test_put_gpu_ids_reports_free_gpu_ids(self, admin_client):
+        response = admin_client.put("/resources", json={"gpu_ids": [0, 1, 3]})
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["free_gpu_ids"] == [0, 1, 3]
+        assert data["max_contiguous_free_gpus"] == 2
+
+    def test_put_without_gpu_ids_still_reports_free_gpu_fields(self, admin_client):
+        # gpu_ids is None on this path, so the response must not depend on it.
+        response = admin_client.put("/resources", json={"total_cpus": 8})
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "free_gpu_ids" in data
+        assert "max_contiguous_free_gpus" in data
+
+    def test_put_without_gpu_ids_reports_free_ids_of_stored_configuration(self, admin_client):
+        crud.set_resources(gpu_ids=[0, 1, 2, 3])
+        _persist_job(status=models.JobStatus.RUNNING, req_gpus=1, assigned_gpus=[1])
+
+        data = admin_client.put("/resources", json={"total_cpus": 8}).json()
+
+        assert data["free_gpu_ids"] == [0, 2, 3]
+        assert data["max_contiguous_free_gpus"] == 2
 
     def test_duplicate_gpu_ids_returns_422(self, admin_client):
         response = admin_client.put("/resources", json={"gpu_ids": [1, 1]})
@@ -836,3 +920,12 @@ class TestServiceHttpClient:
         info = service.get_resources()
         assert isinstance(info, service.ResourceInfo)
         assert info.total_cpus >= 0
+
+    def test_get_resources_parses_free_gpu_fields(self):
+        crud.set_resources(gpu_ids=[0, 1, 2, 3])
+        _persist_job(status=models.JobStatus.RUNNING, req_gpus=1, assigned_gpus=[1])
+
+        info = service.get_resources()
+
+        assert info.free_gpu_ids == [0, 2, 3]
+        assert info.max_contiguous_free_gpus == 2

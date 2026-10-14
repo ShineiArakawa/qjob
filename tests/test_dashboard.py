@@ -170,6 +170,45 @@ class TestRenderResources:
         output = _render_to_str(dashboard._render_resources(info))
         assert "N/A" in output
 
+    def test_free_gpu_ids_and_largest_block_displayed(self):
+        info = _make_resource_info(free_gpu_ids=[0, 2, 3], max_contiguous_free_gpus=2)
+        output = _render_to_str(dashboard._render_resources(info))
+        assert "Free IDs" in output
+        assert "0,2,3" in output
+        assert "max block 2" in output
+
+    def test_free_gpu_row_omitted_when_server_did_not_report_it(self):
+        # An older server omits both fields, so they arrive as None.
+        info = _make_resource_info(free_gpu_ids=None, max_contiguous_free_gpus=None)
+        output = _render_to_str(dashboard._render_resources(info))
+        assert "Free IDs" not in output
+        assert "max block" not in output
+
+    def test_free_gpu_row_omitted_without_gpus(self):
+        info = _make_resource_info(
+            total_gpus=0, used_gpus=0,
+            free_gpu_ids=[], max_contiguous_free_gpus=0,
+        )
+        output = _render_to_str(dashboard._render_resources(info))
+        assert "Free IDs" not in output
+        assert "max block" not in output
+
+    def test_no_free_gpu_ids_shows_dash_and_zero_block(self):
+        info = _make_resource_info(
+            total_gpus=4, used_gpus=4,
+            free_gpu_ids=[], max_contiguous_free_gpus=0,
+        )
+        output = _render_to_str(dashboard._render_resources(info))
+        free_line = next(ln for ln in output.splitlines() if "Free IDs" in ln)
+        assert "—" in free_line
+        assert "max block 0" in free_line
+
+    def test_free_gpu_ids_without_largest_block(self):
+        info = _make_resource_info(free_gpu_ids=[0, 2], max_contiguous_free_gpus=None)
+        output = _render_to_str(dashboard._render_resources(info))
+        assert "0,2" in output
+        assert "max block" not in output
+
 
 # --------------------------------------------------------------------------------------
 # _render_stats

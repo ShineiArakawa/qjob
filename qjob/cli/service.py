@@ -146,6 +146,12 @@ class ResourceInfo:
         GPU devices currently allocated to running jobs.
     used_mem_mb : int
         Memory currently allocated to running jobs in megabytes.
+    free_gpu_ids : list[int] | None
+        Configured GPU IDs that no running or cancelling job holds.  None
+        means the server did not report them (an older qjob server).
+    max_contiguous_free_gpus : int | None
+        Length of the longest run of consecutive IDs in ``free_gpu_ids``.
+        None means the server did not report it.
     """
 
     total_cpus:       int
@@ -156,6 +162,9 @@ class ResourceInfo:
     used_gpus:        int
     used_mem_mb:      int
     gpu_ids:          list[int] = dataclasses.field(default_factory=list)
+
+    free_gpu_ids:             list[int] | None = None
+    max_contiguous_free_gpus: int | None = None
 
 
 # --------------------------------------------------------------------------------------
@@ -673,4 +682,6 @@ def _parse_resource(data: dict) -> ResourceInfo:
         used_cpus=data["used_cpus"],
         used_gpus=data["used_gpus"],
         used_mem_mb=data["used_mem_mb"],
+        free_gpu_ids=data.get("free_gpu_ids"),
+        max_contiguous_free_gpus=data.get("max_contiguous_free_gpus"),
     )

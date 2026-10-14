@@ -224,6 +224,16 @@ def _render_resources(
         _bar(resources.used_gpus, resources.total_gpus, "blue"),
         f"{resources.used_gpus}/{resources.total_gpus}  ({free_gpus} free)",
     )
+    if resources.free_gpu_ids is not None and resources.total_gpus > 0:
+        max_block = (
+            f"max block {resources.max_contiguous_free_gpus}"
+            if resources.max_contiguous_free_gpus is not None else ""
+        )
+        table.add_row(
+            "Free IDs",
+            ",".join(str(i) for i in resources.free_gpu_ids) or "—",
+            max_block,
+        )
     table.add_row(
         "Memory",
         _bar(resources.used_mem_mb, resources.total_mem_mb, "magenta"),

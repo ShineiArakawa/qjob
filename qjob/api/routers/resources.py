@@ -117,6 +117,8 @@ def _info_to_response(info: crud.ResourceInfo) -> schemas.ResourceResponse:
         total_mem_mb=info.total_mem_mb,
         max_walltime_sec=info.max_walltime_sec,
         gpu_ids=info.gpu_ids,
+        free_gpu_ids=info.free_gpu_ids,
+        max_contiguous_free_gpus=info.max_contiguous_free_gpus,
         used_cpus=info.used_cpus,
         used_gpus=info.used_gpus,
         used_mem_mb=info.used_mem_mb,
