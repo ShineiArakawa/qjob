@@ -522,7 +522,9 @@ def dash(
     """
     Open the live TUI dashboard showing job status and resource usage.
 
-    Connects to the local database directly.  Press Ctrl+C to exit.
+    The dashboard reads its data through the qjob API (QJOB_API_URL), not
+    from the database.  The command still initialises the database
+    connection, so QJOB_DB_URL must be set.  Press Ctrl+C to exit.
     """
 
     database.init_db()

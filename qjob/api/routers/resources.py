@@ -34,7 +34,8 @@ def get_resources(
     Returns
     -------
     schemas.ResourceResponse
-        Total and used resource counts.
+        Total and used resource counts, the free GPU IDs, and the length of
+        the largest block of consecutive free GPU IDs.
     """
 
     info = crud.get_resources()

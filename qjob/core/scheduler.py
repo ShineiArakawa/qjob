@@ -739,8 +739,8 @@ class Scheduler:
             Estimated seconds until the head job's resources are available.
         slots_remaining : int | None
             Maximum number of jobs to return.  ``None`` (the default) means no
-            limit; ``_tick()`` passes none and enforces the worker slot limit
-            itself, counting only the jobs it actually starts.
+            limit; ``_tick()`` omits the argument and enforces the worker slot
+            limit itself, counting only the jobs it actually starts.
 
         Returns
         -------
