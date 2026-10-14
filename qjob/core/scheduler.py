@@ -11,6 +11,7 @@ import sqlalchemy
 import sqlalchemy.orm
 
 import qjob.core.database as database
+import qjob.core.gpu_blocks as gpu_blocks
 import qjob.core.models as models
 import qjob.core.runner as runner
 
@@ -373,6 +374,8 @@ class Scheduler:
            Effective priority is computed in-memory (base priority + ageing);
            the DB value is never mutated.
         3. Try to run the head job; fall back to EASY Backfill when blocked.
+           A job starts only when it fits the resource counters and a block of
+           consecutive free GPU IDs exists for it.
         4. Stop at the first blocked head (single reservation guarantee).
         5. Repeat until the worker slot limit is reached.
 
@@ -402,10 +405,17 @@ class Scheduler:
                 key=lambda j: (-self._effective_priority(j), j.submitted_at or 0)
             )
 
+            resource_row = session.get(models.Resource, 1)
+            if resource_row is None:
+                return
+
+            # One mutable set of free GPU IDs for the whole tick, so the block a
+            # job is judged against is exactly the block it is given.
+            free_gpu_ids = self._free_gpu_ids(session, resource_row)
+
             dispatched = 0
             launched_ids: set[str] = set()
             reserved_cpu_ids: set[int] = set()
-            reserved_gpu_ids: set[int] = set()
 
             for head_idx, head in enumerate(candidates):
                 if dispatched >= slots:
@@ -413,22 +423,19 @@ class Scheduler:
                 if head.id in launched_ids:
                     continue
 
-                resource_row = session.get(models.Resource, 1)
-                if resource_row is None:
-                    break
-
-                if resource_row.can_fit(head):
+                gpu_block = self._select_gpu_block(resource_row, head, free_gpu_ids)
+                if gpu_block is not None:          # [] (CPU-only) is a valid block
                     cpu_ids, gpu_ids = self._allocate_db(
                         session,
                         resource_row,
                         head,
+                        gpu_ids=gpu_block,
                         reserved_cpu_ids=reserved_cpu_ids,
-                        reserved_gpu_ids=reserved_gpu_ids,
                     )
                     self._launch(session, head, cpu_ids, gpu_ids)
                     launched_ids.add(head.id)
                     reserved_cpu_ids.update(cpu_ids)
-                    reserved_gpu_ids.update(gpu_ids)
+                    free_gpu_ids.difference_update(gpu_ids)
                     dispatched += 1
                 else:
                     reservation_sec = self._estimate_reservation_window(session, head)
@@ -440,26 +447,27 @@ class Scheduler:
                             slots_remaining=slots - dispatched,
                         )
                         for bf_job in backfill:
-                            resource_row = session.get(models.Resource, 1)
-                            if resource_row is None:
-                                break
-                            if resource_row.can_fit(bf_job):
-                                cpu_ids, gpu_ids = self._allocate_db(
-                                    session,
-                                    resource_row,
-                                    bf_job,
-                                    reserved_cpu_ids=reserved_cpu_ids,
-                                    reserved_gpu_ids=reserved_gpu_ids,
-                                )
-                                self._launch(session, bf_job, cpu_ids, gpu_ids)
-                                launched_ids.add(bf_job.id)
-                                reserved_cpu_ids.update(cpu_ids)
-                                reserved_gpu_ids.update(gpu_ids)
-                                dispatched += 1
-                                logger.info(
-                                    "Backfilled job %s (walltime=%ss, window=%ss).",
-                                    bf_job.id, bf_job.walltime_sec, reservation_sec,
-                                )
+                            bf_block = self._select_gpu_block(
+                                resource_row, bf_job, free_gpu_ids
+                            )
+                            if bf_block is None:
+                                continue
+                            cpu_ids, gpu_ids = self._allocate_db(
+                                session,
+                                resource_row,
+                                bf_job,
+                                gpu_ids=bf_block,
+                                reserved_cpu_ids=reserved_cpu_ids,
+                            )
+                            self._launch(session, bf_job, cpu_ids, gpu_ids)
+                            launched_ids.add(bf_job.id)
+                            reserved_cpu_ids.update(cpu_ids)
+                            free_gpu_ids.difference_update(gpu_ids)
+                            dispatched += 1
+                            logger.info(
+                                "Backfilled job %s (walltime=%ss, window=%ss).",
+                                bf_job.id, bf_job.walltime_sec, reservation_sec,
+                            )
                     break  # EASY Backfill: stop at the first blocked head
 
             if dispatched:
@@ -715,21 +723,96 @@ class Scheduler:
 
         return result
 
+    def _free_gpu_ids(
+        self,
+        session:      sqlalchemy.orm.Session,
+        resource_row: models.Resource,
+    ) -> set[int]:
+        """
+        Return the configured GPU IDs that no RUNNING or CANCELLING job holds.
+
+        Jobs launched earlier in the same tick are still QUEUED in the DB, so
+        this is a snapshot taken before any launch; the caller removes the GPUs
+        of each job it launches from the returned set.
+
+        Parameters
+        ----------
+        session : sqlalchemy.orm.Session
+            Open DB session.
+        resource_row : models.Resource
+            The resource row that lists the configured GPU IDs.
+
+        Returns
+        -------
+        set[int]
+            GPU IDs that are free according to the DB.
+        """
+
+        occupied: set[int] = set()
+        running_jobs = (
+            session.query(models.Job)
+            .filter(models.Job.status.in_([
+                models.JobStatus.RUNNING,
+                models.JobStatus.CANCELLING,
+            ]))
+            .all()
+        )
+        for rj in running_jobs:
+            if rj.assigned_gpus:
+                occupied.update(json.loads(rj.assigned_gpus))
+
+        return set(resource_row.configured_gpu_ids) - occupied
+
+    def _select_gpu_block(
+        self,
+        resource_row: models.Resource,
+        job:          models.Job,
+        free_gpu_ids: set[int],
+    ) -> list[int] | None:
+        """
+        Return the GPU IDs *job* would run on now, or None if it cannot start.
+
+        A job can start only when the resource counters fit it and a block of
+        ``job.req_gpus`` consecutive IDs is free.  CPU-only jobs get ``[]``.
+
+        Parameters
+        ----------
+        resource_row : models.Resource
+            The locked resource row whose ``used_*`` counters are checked.
+        job : models.Job
+            The job to place.
+        free_gpu_ids : set[int]
+            GPU IDs that are free right now, including the effect of jobs
+            launched earlier in this tick.
+
+        Returns
+        -------
+        list[int] | None
+            The GPU IDs to assign, ``[]`` for a job that needs no GPU, or
+            ``None`` when the job cannot start now.
+        """
+
+        if not resource_row.can_fit(job):
+            return None
+        return gpu_blocks.find_contiguous_block(free_gpu_ids, job.req_gpus)
+
     def _allocate_db(
         self,
         session:          sqlalchemy.orm.Session,
         resource_row:     models.Resource,
         job:              models.Job,
+        gpu_ids:          list[int],
         reserved_cpu_ids: set[int] | None = None,
-        reserved_gpu_ids: set[int] | None = None,
     ) -> tuple[list[int], list[int]]:
         """
-        Assign CPU and GPU IDs to *job* and update the DB resource counts.
+        Assign CPU IDs to *job*, record its GPU block, and update the DB
+        resource counts.
 
         CPU IDs are chosen from the set that are not currently in use by any
-        RUNNING job.  The resource row's ``used_*`` counters are incremented
-        atomically within the locked transaction started by
-        ``get_session_for_update()``.
+        RUNNING job.  GPU IDs are not chosen here: *gpu_ids* is the block the
+        caller already picked with ``_select_gpu_block()``.  The resource row's
+        ``used_*`` counters are incremented atomically within the locked
+        transaction started by ``get_session_for_update()``.
 
         Parameters
         ----------
@@ -739,10 +822,10 @@ class Scheduler:
             The locked resource row to update.
         job : models.Job
             The job to allocate resources for.
+        gpu_ids : list[int]
+            GPU IDs chosen for the job; ``[]`` when it needs no GPU.
         reserved_cpu_ids : set[int] | None
             CPU IDs already assigned earlier in the current scheduler tick.
-        reserved_gpu_ids : set[int] | None
-            GPU IDs already assigned earlier in the current scheduler tick.
 
         Returns
         -------
@@ -750,10 +833,9 @@ class Scheduler:
             ``(cpu_ids, gpu_ids)`` of the assigned resource indices.
         """
 
-        # Determine which CPU/GPU IDs are already in use, including jobs
-        # launched earlier in this tick that are not RUNNING in the DB yet.
+        # Determine which CPU IDs are already in use, including jobs launched
+        # earlier in this tick that are not RUNNING in the DB yet.
         occupied_cpus: set[int] = set(reserved_cpu_ids or set())
-        occupied_gpus: set[int] = set(reserved_gpu_ids or set())
         running_jobs = (
             session.query(models.Job)
             .filter(models.Job.status.in_([
@@ -765,25 +847,19 @@ class Scheduler:
         for rj in running_jobs:
             if rj.assigned_cpus:
                 occupied_cpus.update(json.loads(rj.assigned_cpus))
-            if rj.assigned_gpus:
-                occupied_gpus.update(json.loads(rj.assigned_gpus))
 
         free_cpus = [
             i for i in range(resource_row.total_cpus) if i not in occupied_cpus
         ]
-        free_gpus = [
-            i for i in resource_row.configured_gpu_ids if i not in occupied_gpus
-        ]
 
         cpu_ids = free_cpus[:job.req_cpus]
-        gpu_ids = free_gpus[:job.req_gpus]
 
         # Update counters atomically.
         resource_row.used_cpus += len(cpu_ids)
         resource_row.used_gpus += len(gpu_ids)
         resource_row.used_mem_mb += job.req_mem_mb
 
-        return cpu_ids, gpu_ids
+        return cpu_ids, list(gpu_ids)
 
     def _launch(
         self,

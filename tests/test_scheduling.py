@@ -87,8 +87,25 @@ def _make_running_job(
     req_mem_mb:   int = 512,
     walltime_sec: int | None = 3600,
     started_seconds_ago: int = 0,
+    gpu_ids:      list[int] | None = None,
+    cpu_ids:      list[int] | None = None,
+    status:       models.JobStatus = models.JobStatus.RUNNING,
 ) -> models.Job:
-    """Insert and return a RUNNING job."""
+    """
+    Insert and return a RUNNING job, or a job in another resource-holding status.
+
+    The resources row's ``used_*`` counters are not touched; a test that needs
+    them to match its running jobs must set them with ``_configure_resources()``.
+
+    Parameters
+    ----------
+    gpu_ids : list[int] | None
+        GPU IDs the job holds.  None means ``range(req_gpus)``.
+    cpu_ids : list[int] | None
+        CPU IDs the job holds.  None means ``range(req_cpus)``.
+    status : models.JobStatus
+        Stored status, e.g. CANCELLING for a job that still holds its GPUs.
+    """
 
     started = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
         seconds=started_seconds_ago
@@ -96,24 +113,87 @@ def _make_running_job(
     job = models.Job(
         user="alice",
         script_path="/tmp/job.sh",
-        status=models.JobStatus.RUNNING,
+        status=status,
         req_cpus=req_cpus,
         req_gpus=req_gpus,
         req_mem_mb=req_mem_mb,
         walltime_sec=walltime_sec,
         started_at=started,
-        assigned_cpus=json.dumps(list(range(req_cpus))),
-        assigned_gpus=json.dumps(list(range(req_gpus))),
+        assigned_cpus=json.dumps(list(range(req_cpus)) if cpu_ids is None else cpu_ids),
+        assigned_gpus=json.dumps(list(range(req_gpus)) if gpu_ids is None else gpu_ids),
     )
     with database.get_session() as session:
         session.add(job)
     return job
 
 
+def _configure_resources(
+    cpus:        int,
+    mem_mb:      int,
+    gpu_ids:     list[int],
+    used_cpus:   int = 0,
+    used_gpus:   int = 0,
+    used_mem_mb: int = 0,
+) -> None:
+    """
+    Set the resources row (id=1) to the given capacity and usage.
+
+    Parameters
+    ----------
+    cpus : int
+        Total CPU cores.
+    mem_mb : int
+        Total memory in megabytes.
+    gpu_ids : list[int]
+        Configured GPU device IDs; ``total_gpus`` is derived from the list.
+    used_cpus : int
+        CPU cores held by running jobs.
+    used_gpus : int
+        GPUs held by running jobs.
+    used_mem_mb : int
+        Memory held by running jobs, in megabytes.
+    """
+
+    with database.get_session() as session:
+        row = session.get(models.Resource, 1)
+        row.total_cpus = cpus
+        row.total_mem_mb = mem_mb
+        row.set_configured_gpu_ids(gpu_ids)
+        row.used_cpus = used_cpus
+        row.used_gpus = used_gpus
+        row.used_mem_mb = used_mem_mb
+
+
 def _make_scheduler(**kwargs) -> scheduler.Scheduler:
     """Return a Scheduler with the given kwargs."""
 
     return scheduler.Scheduler(**kwargs)
+
+
+def _patch_start_job(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Replace ``runner.start_job`` with a stub and return the IDs it is called with."""
+
+    launched: list[str] = []
+
+    def _fake_start_job(job, resource_pool):
+        launched.append(job.id)
+
+    monkeypatch.setattr(scheduler.runner, "start_job", _fake_start_job)
+    return launched
+
+
+def _placement(job: models.Job) -> tuple[models.JobStatus, list[int] | None]:
+    """
+    Re-read *job* from the DB and return ``(status, assigned GPU IDs)``.
+
+    The GPU IDs are None when nothing is assigned, so a running CPU-only job
+    (``[]``) stays distinguishable from a job that has not started (None).
+    """
+
+    with database.get_session() as session:
+        stored = session.get(models.Job, job.id)
+        assigned = stored.assigned_gpus
+        return stored.status, (None if assigned is None else json.loads(assigned))
 
 
 # --------------------------------------------------------------------------------------
@@ -396,7 +476,7 @@ class TestTickAllocation:
         with database.get_session() as session:
             row = session.get(models.Resource, 1)
             row.total_cpus = 1
-            row.set_configured_gpu_ids([2, 5])
+            row.set_configured_gpu_ids([4, 5])
             row.total_mem_mb = 4096
 
         sched = _make_scheduler(max_workers=1)
@@ -407,7 +487,7 @@ class TestTickAllocation:
             gpu_ids = json.loads(stored.assigned_gpus)
 
         assert launched == [job.id]
-        assert gpu_ids == [2, 5]
+        assert gpu_ids == [4, 5]
 
     def test_launched_job_is_marked_running_in_scheduler_transaction(self, monkeypatch):
         launched: list[str] = []
@@ -451,6 +531,223 @@ class TestTickAllocation:
         asyncio.run(sched._tick())
 
         assert launched == [job.id]
+
+
+# --------------------------------------------------------------------------------------
+# Scheduler tick — contiguous GPU blocks
+
+
+class TestContiguousGpuAllocation:
+    """
+    _tick() places a job on one block of consecutive GPU IDs.
+
+    Every test gives the node plenty of CPUs and memory, so only the GPU
+    layout decides whether a job can start, and it orders jobs by priority.
+    ``_make_running_job()`` does not touch the ``used_*`` counters, so each
+    test sets them to match the running jobs it inserts.
+    """
+
+    def test_multi_gpu_job_gets_contiguous_block_when_fragmented(self, monkeypatch):
+        """
+        GPU 1 is busy, so the free IDs are 0, 2, 3.  A 2-GPU job takes the
+        consecutive pair [2, 3], not the first two free IDs [0, 2].
+        """
+        launched = _patch_start_job(monkeypatch)
+        _configure_resources(
+            cpus=16, mem_mb=65536, gpu_ids=[0, 1, 2, 3],
+            used_cpus=1, used_gpus=1, used_mem_mb=512,
+        )
+        _make_running_job(req_gpus=1, gpu_ids=[1], walltime_sec=3600)
+        job = _make_queued_job(req_gpus=2)
+
+        sched = _make_scheduler(max_workers=10)
+        asyncio.run(sched._tick())
+
+        assert launched == [job.id]
+        assert _placement(job) == (models.JobStatus.RUNNING, [2, 3])
+
+    def test_multi_gpu_job_waits_without_contiguous_block(self, monkeypatch):
+        """
+        GPUs 1 and 2 are busy, so the free IDs are 0 and 3.  The counters
+        say two GPUs are free, but no two of them are consecutive: the 2-GPU
+        job waits.  Its reservation window cannot be estimated (the running
+        jobs have no walltime), so the 1-GPU job behind it is not backfilled.
+        """
+        launched = _patch_start_job(monkeypatch)
+        _configure_resources(
+            cpus=16, mem_mb=65536, gpu_ids=[0, 1, 2, 3],
+            used_cpus=2, used_gpus=2, used_mem_mb=1024,
+        )
+        _make_running_job(req_gpus=1, gpu_ids=[1], cpu_ids=[0], walltime_sec=None)
+        _make_running_job(req_gpus=1, gpu_ids=[2], cpu_ids=[1], walltime_sec=None)
+        wide = _make_queued_job(req_gpus=2, priority=90)
+        narrow = _make_queued_job(req_gpus=1, priority=10, walltime_sec=60)
+
+        sched = _make_scheduler(max_workers=10)
+        asyncio.run(sched._tick())
+
+        assert launched == []
+        assert _placement(wide) == (models.JobStatus.QUEUED, None)
+        assert _placement(narrow) == (models.JobStatus.QUEUED, None)
+
+    def test_stale_free_set_regression(self, monkeypatch):
+        """
+        Jobs launched earlier in a tick are still QUEUED in the DB (the session
+        does not autoflush), so the free GPU IDs must be tracked in memory.
+
+        Layout: GPUs 0-7 with [3, 4] busy, three 2-GPU jobs.  The first takes
+        [0, 1], the second must see that and take [5, 6], and the third finds
+        only the isolated IDs 2 and 7 left, so it waits.
+        """
+        launched = _patch_start_job(monkeypatch)
+        _configure_resources(
+            cpus=16, mem_mb=65536, gpu_ids=list(range(8)),
+            used_cpus=1, used_gpus=2, used_mem_mb=512,
+        )
+        _make_running_job(req_gpus=2, gpu_ids=[3, 4], walltime_sec=3600)
+        first = _make_queued_job(req_gpus=2, priority=90)
+        second = _make_queued_job(req_gpus=2, priority=80)
+        third = _make_queued_job(req_gpus=2, priority=70)
+
+        sched = _make_scheduler(max_workers=10)
+        asyncio.run(sched._tick())
+
+        assert launched == [first.id, second.id]
+        assert _placement(first) == (models.JobStatus.RUNNING, [0, 1])
+        assert _placement(second) == (models.JobStatus.RUNNING, [5, 6])
+        assert _placement(third) == (models.JobStatus.QUEUED, None)
+
+    def test_same_tick_double_gpu_jobs_get_disjoint_blocks(self, monkeypatch):
+        launched = _patch_start_job(monkeypatch)
+        _configure_resources(cpus=16, mem_mb=65536, gpu_ids=[0, 1, 2, 3])
+        first = _make_queued_job(req_gpus=2, priority=90)
+        second = _make_queued_job(req_gpus=2, priority=80)
+
+        sched = _make_scheduler(max_workers=10)
+        asyncio.run(sched._tick())
+
+        assert launched == [first.id, second.id]
+        assert _placement(first) == (models.JobStatus.RUNNING, [0, 1])
+        assert _placement(second) == (models.JobStatus.RUNNING, [2, 3])
+
+    def test_cancelling_job_gpus_are_occupied(self, monkeypatch):
+        """A CANCELLING job still holds its GPUs, so they are not offered."""
+        launched = _patch_start_job(monkeypatch)
+        _configure_resources(
+            cpus=16, mem_mb=65536, gpu_ids=[0, 1, 2, 3],
+            used_cpus=1, used_gpus=2, used_mem_mb=512,
+        )
+        _make_running_job(
+            req_gpus=2, gpu_ids=[0, 1], status=models.JobStatus.CANCELLING,
+        )
+        job = _make_queued_job(req_gpus=2)
+
+        sched = _make_scheduler(max_workers=10)
+        asyncio.run(sched._tick())
+
+        assert launched == [job.id]
+        assert _placement(job) == (models.JobStatus.RUNNING, [2, 3])
+
+    def test_cpu_only_job_starts_when_all_gpus_busy(self, monkeypatch):
+        """
+        A job that needs no GPU gets the empty block ``[]``.  That is a valid
+        block, not "no block", so it starts even though every GPU is busy.
+        """
+        launched = _patch_start_job(monkeypatch)
+        _configure_resources(
+            cpus=16, mem_mb=65536, gpu_ids=[0, 1],
+            used_cpus=1, used_gpus=2, used_mem_mb=512,
+        )
+        _make_running_job(req_gpus=2, gpu_ids=[0, 1], walltime_sec=3600)
+        job = _make_queued_job(req_gpus=0)
+
+        sched = _make_scheduler(max_workers=10)
+        asyncio.run(sched._tick())
+
+        assert launched == [job.id]
+        assert _placement(job) == (models.JobStatus.RUNNING, [])
+
+    def test_single_gpu_job_prefers_isolated_gpu(self, monkeypatch):
+        """
+        With GPU 2 busy, the free runs are [0, 1] and [3].  A 1-GPU job takes
+        the isolated GPU 3 and leaves the pair for a 2-GPU job.
+        """
+        launched = _patch_start_job(monkeypatch)
+        _configure_resources(
+            cpus=16, mem_mb=65536, gpu_ids=[0, 1, 2, 3],
+            used_cpus=1, used_gpus=1, used_mem_mb=512,
+        )
+        _make_running_job(req_gpus=1, gpu_ids=[2], walltime_sec=3600)
+        job = _make_queued_job(req_gpus=1)
+
+        sched = _make_scheduler(max_workers=10)
+        asyncio.run(sched._tick())
+
+        assert launched == [job.id]
+        assert _placement(job) == (models.JobStatus.RUNNING, [3])
+
+    def test_unsorted_configured_ids(self, monkeypatch):
+        """The block does not depend on the order the GPU IDs were configured in."""
+        launched = _patch_start_job(monkeypatch)
+        _configure_resources(cpus=16, mem_mb=65536, gpu_ids=[3, 2, 1, 0])
+        job = _make_queued_job(req_gpus=2)
+
+        sched = _make_scheduler(max_workers=10)
+        asyncio.run(sched._tick())
+
+        assert launched == [job.id]
+        assert _placement(job) == (models.JobStatus.RUNNING, [0, 1])
+
+    def test_failed_launch_keeps_block_reserved_for_rest_of_tick(self, monkeypatch):
+        """
+        When start_job fails, the DB counters are rolled back but the block stays
+        out of the free set until the tick ends.
+
+        Layout: GPUs [0, 1], two 2-GPU jobs.  In tick 1 job A takes [0, 1] and
+        fails to start.  The counters then say two GPUs are free, yet job B must
+        not be placed on the block A just failed on, so it stays QUEUED.  Tick 2
+        reads the free set from the DB again and gives B the block.
+        """
+        _configure_resources(cpus=16, mem_mb=65536, gpu_ids=[0, 1])
+        job_a = _make_queued_job(req_gpus=2, priority=90)
+        job_b = _make_queued_job(req_gpus=2, priority=80)
+
+        def _fake_start_job(job, resource_pool):
+            if job.id == job_a.id:
+                raise RuntimeError("simulated launch failure")
+
+        monkeypatch.setattr(scheduler.runner, "start_job", _fake_start_job)
+
+        sched = _make_scheduler(max_workers=4)
+        asyncio.run(sched._tick())
+
+        assert _placement(job_a) == (models.JobStatus.FAILED, None)
+        assert _placement(job_b) == (models.JobStatus.QUEUED, None)
+        with database.get_session() as session:
+            assert session.get(models.Resource, 1).used_gpus == 0
+
+        asyncio.run(sched._tick())
+
+        assert _placement(job_b) == (models.JobStatus.RUNNING, [0, 1])
+        with database.get_session() as session:
+            assert session.get(models.Resource, 1).used_gpus == 2
+
+    def test_counters_must_also_fit(self, monkeypatch):
+        """
+        A free block alone is not enough: the ``used_gpus`` counter must also
+        leave room.  All four IDs are free but the counter says three are in use.
+        """
+        launched = _patch_start_job(monkeypatch)
+        _configure_resources(
+            cpus=16, mem_mb=65536, gpu_ids=[0, 1, 2, 3], used_gpus=3,
+        )
+        job = _make_queued_job(req_gpus=2)
+
+        sched = _make_scheduler(max_workers=10)
+        asyncio.run(sched._tick())
+
+        assert launched == []
+        assert _placement(job) == (models.JobStatus.QUEUED, None)
 
 
 # --------------------------------------------------------------------------------------
