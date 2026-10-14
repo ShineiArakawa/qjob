@@ -987,14 +987,15 @@ class TestBackfillWithGpuBlocks:
         """
         X holds GPU 1 for 1000s, so the head's window is about 900s.  B1 and B3
         (800s) fit it and each take one of the isolated GPUs, 0 and 3, without
-        overlapping.  B2 (1000s) is longer than the window.  The head stays
-        queued.
+        overlapping.  B2 (1000s) is longer than the window.  Its priority sits
+        between B1's and B3's, so if the window failed to exclude it, B2 would
+        take GPU 3 before B3 and the test would fail.  The head stays queued.
         """
         launched = _patch_start_job(monkeypatch)
         head = _setup_blocked_head(x_walltime_sec=1000)
         b1 = _make_queued_job(req_gpus=1, priority=50, walltime_sec=800)
+        b2 = _make_queued_job(req_gpus=1, priority=47, walltime_sec=1000)
         b3 = _make_queued_job(req_gpus=1, priority=45, walltime_sec=800)
-        b2 = _make_queued_job(req_gpus=1, priority=40, walltime_sec=1000)
 
         sched = _make_scheduler(max_workers=10)
         asyncio.run(sched._tick())
