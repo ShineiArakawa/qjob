@@ -11,7 +11,11 @@ import qjob.cli.service as service
 # Helper
 
 
-def _render_to_str(renderable) -> str:
+def _render_to_str(
+    renderable,
+    width:  int = 200,
+    height: int | None = None,
+) -> str:
     """
     Render a Rich renderable to a plain string for assertion.
 
@@ -19,6 +23,11 @@ def _render_to_str(renderable) -> str:
     ----------
     renderable : object
         Any Rich renderable (Panel, Table, Text, Layout, …).
+    width : int
+        Console width in columns.
+    height : int | None
+        Console height in rows.  A Layout fills exactly this many rows; when
+        None, Rich uses its default height.
 
     Returns
     -------
@@ -27,7 +36,8 @@ def _render_to_str(renderable) -> str:
     """
 
     console = rich.console.Console(
-        width=200,
+        width=width,
+        height=height,
         highlight=False,
         no_color=True,
         force_terminal=False,
@@ -388,3 +398,31 @@ class TestBuildLayout:
         monkeypatch.setattr(service, "get_resources", _raise)
         output = _render_to_str(dashboard._build_layout(refresh_interval=3.0))
         assert "Connection refused" in output
+
+    def test_memory_row_stays_visible_next_to_the_free_ids_row(self, monkeypatch):
+        # The middle pane has a fixed height and its panel crops from the
+        # bottom, so a pane that is too short hides the Memory row first.
+        # 100 columns is a common half-screen width at which every row wraps.
+        def _forbid_http(*args, **kwargs):
+            raise AssertionError("this test must not make HTTP requests")
+
+        # _build_layout only calls get_resources and list_jobs; the guard on
+        # _async_client keeps any other service call off the network.
+        monkeypatch.setattr(service, "_async_client", _forbid_http)
+        monkeypatch.setattr(
+            service, "get_resources",
+            lambda: _make_resource_info(
+                total_gpus=8, used_gpus=3, gpu_ids=list(range(8)),
+                free_gpu_ids=[0, 1, 5, 6, 7], max_contiguous_free_gpus=3,
+            ),
+        )
+        monkeypatch.setattr(service, "list_jobs", lambda **_: [])
+
+        output = _render_to_str(
+            dashboard._build_layout(refresh_interval=3.0), width=100, height=40,
+        )
+
+        assert "0,1,5,6,7" in output
+        assert "max block 3" in output
+        assert "32G/128G" in output
+        assert "G free" in output

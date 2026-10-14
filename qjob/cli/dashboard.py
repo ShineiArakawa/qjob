@@ -99,7 +99,7 @@ def _build_layout(refresh_interval: float) -> rich.layout.Layout:
     layout = rich.layout.Layout()
     layout.split_column(
         rich.layout.Layout(name="header",   size=3),
-        rich.layout.Layout(name="middle",   size=8),
+        rich.layout.Layout(name="middle",   size=10),
         rich.layout.Layout(name="running",  minimum_size=6),
         rich.layout.Layout(name="queued",   minimum_size=6),
         rich.layout.Layout(name="recent",   minimum_size=4),
