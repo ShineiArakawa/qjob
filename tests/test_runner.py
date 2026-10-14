@@ -89,6 +89,18 @@ class TestBuildEnv:
         env = runner._build_env(job)
         assert env["CUDA_VISIBLE_DEVICES"] == ""
 
+    def test_cuda_device_order_defaults_to_pci_bus_id(self, monkeypatch):
+        monkeypatch.delenv("CUDA_DEVICE_ORDER", raising=False)
+        job = _make_job()
+        env = runner._build_env(job)
+        assert env["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+
+    def test_cuda_device_order_set_by_the_daemon_is_kept(self, monkeypatch):
+        monkeypatch.setenv("CUDA_DEVICE_ORDER", "FASTEST_FIRST")
+        job = _make_job()
+        env = runner._build_env(job)
+        assert env["CUDA_DEVICE_ORDER"] == "FASTEST_FIRST"
+
     def test_qjob_job_id_set(self):
         job = _make_job()
         env = runner._build_env(job)

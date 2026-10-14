@@ -416,8 +416,10 @@ def _build_env(job: models.Job) -> dict[str, str]:
     The mapping starts from the daemon environment, drops the variables that
     describe the daemon itself (see ``_DAEMON_ONLY_ENV``), overlays the login
     identity of the submitting user (``HOME``, ``USER``, ``LOGNAME``, ``SHELL``
-    and ``PATH``), sets ``CUDA_VISIBLE_DEVICES`` from the assigned GPU IDs, and
-    finally adds the QJOB metadata variables.
+    and ``PATH``), sets ``CUDA_VISIBLE_DEVICES`` from the assigned GPU IDs,
+    defaults ``CUDA_DEVICE_ORDER`` to ``PCI_BUS_ID`` so that those IDs follow
+    nvidia-smi numbering (a value already set in the daemon environment is
+    kept), and finally adds the QJOB metadata variables.
 
     Parameters
     ----------
@@ -443,6 +445,8 @@ def _build_env(job: models.Job) -> dict[str, str]:
 
     gpu_ids: list[int] = json.loads(job.assigned_gpus) if job.assigned_gpus else []
     env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids) if gpu_ids else ""
+    # CUDA_VISIBLE_DEVICES must use nvidia-smi (PCI bus) numbering
+    env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 
     # Metadata variables available inside the script.
     env["QJOB_JOB_ID"] = job.id
