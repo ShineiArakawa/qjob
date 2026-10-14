@@ -248,6 +248,88 @@ class TestSubmitJob:
         )
         assert response.status_code == 422
 
+    def test_gpus_exceeding_contiguous_block_returns_422(self, client, make_script):
+        crud.set_resources(total_cpus=4, gpu_ids=[0, 2, 5])
+        script = make_script("""\
+            #!/bin/bash
+            #QJOB --gpus 2
+            python x.py
+        """)
+        response = client.post("/jobs", json={"script_path": str(script)})
+        assert response.status_code == 422
+        detail = response.json()["detail"]
+        assert "largest block of consecutive GPU IDs (1)" in detail
+        assert "[0, 2, 5]" in detail
+
+    def test_single_gpu_on_non_contiguous_ids_returns_201(self, client, make_script):
+        crud.set_resources(total_cpus=4, gpu_ids=[0, 2, 5])
+        script = make_script("""\
+            #!/bin/bash
+            #QJOB --gpus 1
+            python x.py
+        """)
+        response = client.post("/jobs", json={"script_path": str(script)})
+        assert response.status_code == 201
+        assert response.json()["req_gpus"] == 1
+
+    def test_gpus_fitting_a_contiguous_block_returns_201(self, client, make_script):
+        crud.set_resources(total_cpus=4, gpu_ids=[0, 1, 3])
+        script = make_script("""\
+            #!/bin/bash
+            #QJOB --gpus 2
+            python x.py
+        """)
+        response = client.post("/jobs", json={"script_path": str(script)})
+        assert response.status_code == 201
+        assert response.json()["req_gpus"] == 2
+
+    def test_contiguity_check_ignores_configured_id_order(self, client, make_script):
+        crud.set_resources(total_cpus=4, gpu_ids=[5, 4, 3])
+        script = make_script("""\
+            #!/bin/bash
+            #QJOB --gpus 3
+            python x.py
+        """)
+        response = client.post("/jobs", json={"script_path": str(script)})
+        assert response.status_code == 201
+        assert response.json()["req_gpus"] == 3
+
+    def test_overrides_exceeding_contiguous_block_returns_422(self, client, make_script):
+        crud.set_resources(total_cpus=4, gpu_ids=[0, 2, 5])
+        script = make_script("""\
+            #!/bin/bash
+            #QJOB --gpus 1
+            python x.py
+        """)
+        response = client.post(
+            "/jobs",
+            json={"script_path": str(script), "overrides": ["--gpus", "2"]},
+        )
+        assert response.status_code == 422
+        assert "largest block of consecutive GPU IDs (1)" in response.json()["detail"]
+
+    def test_zero_gpus_on_non_contiguous_ids_returns_201(self, client, make_script):
+        crud.set_resources(total_cpus=4, gpu_ids=[0, 2, 5])
+        script = make_script("""\
+            #!/bin/bash
+            #QJOB --gpus 0
+            python x.py
+        """)
+        response = client.post("/jobs", json={"script_path": str(script)})
+        assert response.status_code == 201
+        assert response.json()["req_gpus"] == 0
+
+    def test_empty_gpu_config_reports_range_error(self, client, make_script):
+        crud.set_resources(total_cpus=4)
+        script = make_script("""\
+            #!/bin/bash
+            #QJOB --gpus 1
+            python x.py
+        """)
+        response = client.post("/jobs", json={"script_path": str(script)})
+        assert response.status_code == 422
+        assert "out of bounds" in response.json()["detail"]
+
 
 # --------------------------------------------------------------------------------------
 # GET /jobs

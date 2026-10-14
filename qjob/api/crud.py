@@ -11,6 +11,7 @@ import coolname
 import sqlalchemy.orm
 
 import qjob.core.database as database
+import qjob.core.gpu_blocks as gpu_blocks
 import qjob.core.models as models
 import qjob.core.parser as parser
 
@@ -220,7 +221,8 @@ def submit_job(
         resource_row: models.Resource | None = session.get(models.Resource, 1)
 
         total_cpus = resource_row.total_cpus if resource_row is not None else None
-        total_gpus = len(resource_row.configured_gpu_ids) if resource_row is not None else None
+        configured_gpu_ids = list(resource_row.configured_gpu_ids) if resource_row is not None else None
+        total_gpus = len(configured_gpu_ids) if configured_gpu_ids is not None else None
         total_mem_mb = resource_row.total_mem_mb if resource_row is not None else None
         max_walltime = resource_row.max_walltime_sec if resource_row is not None else None
 
@@ -235,6 +237,16 @@ def submit_job(
             f"Requested GPU count {directives.gpus} is out of bounds "
             f"(0–{total_gpus})."
         )
+
+    if configured_gpu_ids is not None:
+        max_block = gpu_blocks.max_contiguous_run(configured_gpu_ids)
+        if directives.gpus > max_block:
+            raise ValueError(
+                f"Requested GPU count {directives.gpus} exceeds the largest block "
+                f"of consecutive GPU IDs ({max_block}) among the managed GPU IDs "
+                f"{sorted(configured_gpu_ids)}. Multi-GPU jobs are placed on "
+                f"consecutive GPU IDs only."
+            )
 
     if total_mem_mb is not None and (directives.mem_mb < 1 or directives.mem_mb > total_mem_mb):
         raise ValueError(
