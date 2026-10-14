@@ -749,6 +749,37 @@ class TestContiguousGpuAllocation:
         assert launched == []
         assert _placement(job) == (models.JobStatus.QUEUED, None)
 
+    def test_backfill_jobs_get_disjoint_contiguous_blocks(self, monkeypatch):
+        """
+        Backfilled jobs are placed like any other: on a contiguous block taken
+        from the same free set as the jobs launched before them in the tick.
+
+        Layout: GPUs 0-5 with [1] busy; a running job also holds CPUs 0-1 for
+        120s.  The head needs all 4 CPUs, so it is blocked with a window of
+        about 108s.  Two 2-GPU backfill jobs (walltime 100s) fit the window.
+        The first takes [2, 3], not the first two free IDs [0, 2]; the second
+        must not reuse it and takes [4, 5].
+        """
+        launched = _patch_start_job(monkeypatch)
+        _configure_resources(
+            cpus=4, mem_mb=65536, gpu_ids=list(range(6)),
+            used_cpus=2, used_gpus=1, used_mem_mb=512,
+        )
+        _make_running_job(
+            req_cpus=2, req_gpus=1, gpu_ids=[1], cpu_ids=[0, 1], walltime_sec=120,
+        )
+        head = _make_queued_job(req_cpus=4, priority=90)
+        backfill_a = _make_queued_job(req_gpus=2, priority=50, walltime_sec=100)
+        backfill_b = _make_queued_job(req_gpus=2, priority=40, walltime_sec=100)
+
+        sched = _make_scheduler(max_workers=10)
+        asyncio.run(sched._tick())
+
+        assert launched == [backfill_a.id, backfill_b.id]
+        assert _placement(head) == (models.JobStatus.QUEUED, None)
+        assert _placement(backfill_a) == (models.JobStatus.RUNNING, [2, 3])
+        assert _placement(backfill_b) == (models.JobStatus.RUNNING, [4, 5])
+
 
 # --------------------------------------------------------------------------------------
 # Scheduler — aging_factor constructor parameter
