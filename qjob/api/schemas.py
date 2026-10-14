@@ -18,10 +18,13 @@ class JobSubmitRequest(pydantic.BaseModel):
         Absolute path to the shell script on the server.
     workdir : str | None
         Working directory to use when running the script.
+    overrides : list[str]
+        Directive arguments in argv form that override the script's #QJOB directives.
     """
 
     script_path: str
     workdir:     str | None = None
+    overrides:   list[str] = []
 
 
 class JobResponse(pydantic.BaseModel):

@@ -228,6 +228,8 @@ python train.py
 | `--priority <LEVEL\|N>` | Scheduling priority. `low`, `normal`, `high`, or integer `0` to `100`. | `normal` (`50`) |
 | `--env <KEY[,KEY...]>` | Parsed as a list of environment variable names. The current runner still starts from the scheduler environment; this option is therefore metadata rather than a strict allow-list. | none |
 
+Options given to `qjob submit` (see below) override the same directives in the script.
+
 Priority labels map to the following values:
 
 | Label | Value |
@@ -286,6 +288,12 @@ qjob submit train.sh
 ```
 
 The CLI validates the script locally and then sends its absolute path and the current working directory to the API server. The script must be accessible on the server where the scheduler runs.
+
+Directives can be overridden from the command line without editing the script. `qjob submit` accepts `--name`, `--cpus`, `--gpus`, `--mem`, `--walltime`, `--priority`, and `--env`, with the same values as the `#QJOB` directives. Options given on the command line take precedence over the script's directives; directives that are not overridden keep the script's values.
+
+```bash
+qjob submit train.sh --cpus 4 --mem 8G --priority high
+```
 
 ### Show job status
 

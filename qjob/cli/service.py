@@ -165,7 +165,7 @@ class ResourceInfo:
 # This keeps the CLI interface synchronous while using AsyncClient internally.
 
 
-def submit_job(script_path: str) -> JobInfo:
+def submit_job(script_path: str, overrides: list[str] | None = None) -> JobInfo:
     """
     Submit a shell script to the job queue via the API.
 
@@ -173,6 +173,9 @@ def submit_job(script_path: str) -> JobInfo:
     ----------
     script_path : str
         Path to the shell script containing ``#QJOB`` directives.
+    overrides : list[str] | None
+        Directive arguments in argv form (e.g. ``["--cpus", "4"]``) that take
+        precedence over the script's ``#QJOB`` directives.
 
     Returns
     -------
@@ -190,8 +193,8 @@ def submit_job(script_path: str) -> JobInfo:
     """
 
     # Validate locally before making the network round trip.
-    parser.parse_script(script_path)
-    return _run(_async_submit_job(script_path))
+    parser.parse_script(script_path, overrides)
+    return _run(_async_submit_job(script_path, overrides or []))
 
 
 def get_job(job_id: str) -> JobInfo | None:
@@ -390,7 +393,7 @@ def set_resources(
 # Async implementations
 
 
-async def _async_submit_job(script_path: str) -> JobInfo:
+async def _async_submit_job(script_path: str, overrides: list[str]) -> JobInfo:
     """Async implementation of submit_job."""
 
     workdir = os.getcwd()
@@ -398,7 +401,7 @@ async def _async_submit_job(script_path: str) -> JobInfo:
     async with _async_client() as client:
         response = await client.post(
             "/jobs",
-            json={"script_path": abs_script_path, "workdir": workdir},
+            json={"script_path": abs_script_path, "workdir": workdir, "overrides": overrides},
         )
         _raise_for_status(response)
     return _parse_job(response.json())

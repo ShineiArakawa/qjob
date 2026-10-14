@@ -56,6 +56,7 @@ def submit_job(
             script_path=body.script_path,
             user=current_user,
             workdir=body.workdir,
+            overrides=body.overrides,
         )
     except FileNotFoundError as exc:
         raise fastapi.HTTPException(status_code=404, detail=str(exc))

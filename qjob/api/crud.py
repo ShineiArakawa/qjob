@@ -169,6 +169,7 @@ def submit_job(
     script_path: str,
     user:        str,
     workdir:     str | None = None,
+    overrides:   list[str] | None = None,
 ) -> JobInfo:
     """
     Parse a shell script and enqueue it as a new job.
@@ -182,6 +183,9 @@ def submit_job(
     workdir : str | None
         Directory used as the subprocess working directory. Defaults to the
         submitted script's parent directory.
+    overrides : list[str] | None
+        Directive arguments in argv form (e.g. ``["--cpus", "4"]``) that take
+        precedence over the script's ``#QJOB`` directives.
 
     Returns
     -------
@@ -201,7 +205,7 @@ def submit_job(
     # --------------------------------------------------------------------------------------
     # Parse directives from the script file.
 
-    directives = parser.parse_script(pathlib.Path(script_path))
+    directives = parser.parse_script(pathlib.Path(script_path), overrides)
 
     # --------------------------------------------------------------------------------------
     # If no name directive was given, generate a random human-readable name.

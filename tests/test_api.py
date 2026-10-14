@@ -220,6 +220,34 @@ class TestSubmitJob:
         response = client.post("/jobs", json={"script_path": str(script)})
         assert response.status_code == 422
 
+    def test_overrides_take_precedence(self, client, make_script):
+        crud.set_resources(total_cpus=4, total_mem_mb=8192)
+        script = make_script("""\
+            #!/bin/bash
+            #QJOB --name from-script --cpus 1 --mem 1G
+            python x.py
+        """)
+        response = client.post(
+            "/jobs",
+            json={
+                "script_path": str(script),
+                "overrides": ["--cpus", "4", "--mem", "8G", "--name", "from-cli"],
+            },
+        )
+        assert response.status_code == 201
+        data = response.json()
+        assert data["req_cpus"] == 4
+        assert data["req_mem_mb"] == 8192
+        assert data["name"] == "from-cli"
+
+    def test_invalid_override_returns_422(self, client, make_script):
+        script = make_script("#QJOB --cpus 2\npython x.py\n")
+        response = client.post(
+            "/jobs",
+            json={"script_path": str(script), "overrides": ["--cpus", "0"]},
+        )
+        assert response.status_code == 422
+
 
 # --------------------------------------------------------------------------------------
 # GET /jobs

@@ -208,15 +208,37 @@ def _complete_cancellable_job_id(incomplete: str) -> list[str]:
 @app.command()
 def submit(
     script: str = typer.Argument(..., help="Path to the shell script to submit."),
+    name: typing.Optional[str] = typer.Option(None, "--name", help="Job name."),
+    cpus: typing.Optional[str] = typer.Option(None, "--cpus", help="Number of CPU cores."),
+    gpus: typing.Optional[str] = typer.Option(None, "--gpus", help="Number of GPUs."),
+    mem: typing.Optional[str] = typer.Option(None, "--mem", help="Memory, e.g. 16G or 512M."),
+    walltime: typing.Optional[str] = typer.Option(
+        None, "--walltime", help="Walltime as HH:MM:SS or MM:SS."
+    ),
+    priority: typing.Optional[str] = typer.Option(
+        None, "--priority", help="low, normal, high, or 0–100."
+    ),
+    env: typing.Optional[str] = typer.Option(
+        None, "--env", help="Comma-separated environment variable names."
+    ),
 ) -> None:
     """
     Submit a shell script to the job queue.
 
-    The script must contain #QJOB directives in its leading comment block.
+    The script may contain #QJOB directives in its leading comment block.
+    Options given on the command line override the corresponding directives.
     """
 
+    overrides: list[str] = []
+    for key, val in [
+        ("name", name), ("cpus", cpus), ("gpus", gpus), ("mem", mem),
+        ("walltime", walltime), ("priority", priority), ("env", env),
+    ]:
+        if val is not None:
+            overrides += [f"--{key}", val]
+
     try:
-        info = service.submit_job(script_path=script)
+        info = service.submit_job(script_path=script, overrides=overrides)
     except ConnectionError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1)

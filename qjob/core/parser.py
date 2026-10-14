@@ -34,7 +34,10 @@ _MEM_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*([KMGT]?)B?$", re.IGNORECASE)
 # --------------------------------------------------------------------------------------
 # Public API
 
-def parse_script(path: str | pathlib.Path) -> JobDirectives:
+def parse_script(
+    path:      str | pathlib.Path,
+    overrides: list[str] | None = None,
+) -> JobDirectives:
     """
     Read a shell script, parse its #QJOB directives, and return the result.
 
@@ -42,6 +45,9 @@ def parse_script(path: str | pathlib.Path) -> JobDirectives:
     ----------
     path : str | pathlib.Path
         Path to the target script.
+    overrides : list[str] | None
+        Extra directive arguments in argv form (e.g. ``["--cpus", "4"]``).
+        They are applied after the script's directives, so they take precedence.
 
     Returns
     -------
@@ -61,7 +67,7 @@ def parse_script(path: str | pathlib.Path) -> JobDirectives:
         raise FileNotFoundError(f"Script not found: {path}")
 
     raw_lines = _extract_directive_lines(path)
-    args = _lines_to_argv(raw_lines)
+    args = _lines_to_argv(raw_lines) + list(overrides or [])
     directives = _parse_argv(args)
     directives.script_path = str(path.resolve())
 

@@ -353,6 +353,45 @@ class TestInvalidValues:
 
 
 # --------------------------------------------------------------------------------------
+# CLI overrides
+
+
+class TestOverrides:
+    """Overrides in argv form take precedence over the script's directives."""
+
+    def test_override_beats_script_directive(self, make_script):
+        p = make_script("""\
+            #!/bin/bash
+            #QJOB --name from-script --cpus 2
+            python x.py
+        """)
+        d = parser.parse_script(p, ["--cpus", "4", "--name", "from-cli"])
+        assert d.cpus == 4
+        assert d.name == "from-cli"
+
+    def test_override_without_script_directives(self, make_script):
+        p = make_script("#!/bin/bash\npython x.py\n")
+        d = parser.parse_script(p, ["--gpus", "2", "--mem", "8G"])
+        assert d.gpus == 2
+        assert d.mem_mb == 8192
+
+    def test_script_directive_kept_when_not_overridden(self, make_script):
+        p = make_script("#QJOB --cpus 2 --gpus 1\npython x.py\n")
+        d = parser.parse_script(p, ["--cpus", "4"])
+        assert (d.cpus, d.gpus) == (4, 1)
+
+    def test_invalid_override_value(self, make_script):
+        p = make_script("#QJOB --cpus 2\npython x.py\n")
+        with pytest.raises(parser.DirectiveParseError, match="--cpus"):
+            parser.parse_script(p, ["--cpus", "0"])
+
+    def test_unknown_override_key(self, make_script):
+        p = make_script("#QJOB --cpus 2\npython x.py\n")
+        with pytest.raises(parser.DirectiveParseError):
+            parser.parse_script(p, ["--bogus", "1"])
+
+
+# --------------------------------------------------------------------------------------
 # Return type test
 
 
