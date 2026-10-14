@@ -14,6 +14,7 @@ The project is intended for small to medium shared GPU servers used in research 
 - systemd service integration with `qjob admin up` / `qjob admin down` for single-command startup.
 - Root-managed execution with privilege dropping to the submitting OS user.
 - CPU affinity via `taskset` and GPU assignment through `CUDA_VISIBLE_DEVICES`.
+- Multi-GPU jobs are placed on a block of consecutive GPU IDs, chosen by best fit.
 - Terminal dashboard for local resource and queue monitoring.
 
 ## Requirements
@@ -164,6 +165,10 @@ qjob admin set-resources --cpus 32 --gpus 4 --mem 1T
 qjob admin set-resources --gpu-ids 0,2,5
 ```
 
+Multi-GPU jobs are placed only on consecutive GPU IDs (see [GPU placement](#gpu-placement)). When the configured IDs have gaps, the largest multi-GPU job is therefore limited by the longest run of consecutive IDs, and a job that requests more GPUs than that is rejected when it is submitted. With `0,2,5`, for example, no two IDs are consecutive, so a job cannot request two or more GPUs; with `0,1,2,5`, a job can request up to three.
+
+GPU IDs are treated in ascending order, not in the order in which they were listed: placement ignores the order of the list, and both `CUDA_VISIBLE_DEVICES` and the free GPU IDs that qjob reports are always ascending. The exception is the `GPU IDs` line of `qjob resources`, which shows the configured IDs in the order in which they were entered.
+
 A maximum per-job walltime can also be configured:
 
 ```bash
@@ -222,7 +227,7 @@ python train.py
 | --- | --- | --- |
 | `--name <NAME>` | Human-readable job name. If omitted, a random readable name is generated. | generated |
 | `--cpus <N>` | Number of CPU cores requested. Must be greater than zero. | `1` |
-| `--gpus <N>` | Number of GPU devices requested. Must be zero or greater. | `0` |
+| `--gpus <N>` | Number of GPU devices requested. Must be zero or greater. Two or more GPUs are placed on consecutive GPU IDs (see [GPU placement](#gpu-placement)). | `0` |
 | `--mem <SIZE>` | Memory request. Accepts values such as `512M`, `8G`, or `1T`. A unitless value is interpreted as bytes. | `1G` |
 | `--walltime <HH:MM:SS>` | Maximum wall-clock runtime. `MM:SS` is also accepted. | unlimited, or admin maximum if configured |
 | `--priority <LEVEL\|N>` | Scheduling priority. `low`, `normal`, `high`, or integer `0` to `100`. | `normal` (`50`) |
@@ -258,6 +263,7 @@ The following variables are injected into the job environment:
 | `QJOB_JOB_NAME` | Job name. |
 | `QJOB_USER` | Submitting username. |
 | `CUDA_VISIBLE_DEVICES` | Comma-separated assigned GPU device IDs, or an empty string for CPU-only jobs. |
+| `CUDA_DEVICE_ORDER` | `PCI_BUS_ID`, unless the scheduler's own environment already sets it, in which case that value is kept. With `PCI_BUS_ID`, the device numbers in `CUDA_VISIBLE_DEVICES` match the numbering shown by `nvidia-smi`. |
 | `HOME` | Home directory of the submitting user, from the password database. |
 | `USER`, `LOGNAME` | Submitting username. |
 | `SHELL` | Login shell of the submitting user. |
@@ -346,7 +352,12 @@ The API returns a bounded tail of the selected log stream. The default maximum i
 qjob resources
 ```
 
-This prints configured totals, current usage, free resources, configured GPU IDs, and the configured maximum walltime.
+This prints configured totals, current usage, free resources, configured GPU IDs, the GPU IDs that are free right now, the size of the largest block of consecutive free GPU IDs, and the configured maximum walltime.
+
+The free IDs are on the `Free GPU IDs` line (`—` when none is free) and the largest block is on the `GPU block` line. A job that requests GPUs needs a free block at least that large: if `GPU block` is smaller than the request, the job waits even when the `GPUs` row shows enough free devices.
+
+- The `FREE` column is computed from the scheduler's usage counters, whereas `Free GPU IDs` and `GPU block` are computed from the GPUs assigned to running (and cancelling) jobs. The `GPUs` row and the two GPU lines can therefore disagree for a short time, for example right after a job ends and before the scheduler has reconciled resource usage.
+- An older qjob server does not return the free GPU fields. Against such a server, the `Free GPU IDs` and `GPU block` lines are not printed.
 
 ### Open the dashboard
 
@@ -355,7 +366,9 @@ qjob dash
 qjob dash --refresh 1.0
 ```
 
-The dashboard reads the local database directly and is intended for use on the qjob host.
+The Resources pane has a `Free IDs` row that lists the GPU IDs that are free right now (`—` when none is free), followed by `max block N`, the size of the largest block of consecutive free IDs. These are the same values as in `qjob resources`, including the caveat that they can briefly disagree with the counter-based GPU free count. The row is not shown when no GPUs are configured or when the server does not report free GPU IDs.
+
+The dashboard gets its data from the REST API, like the other commands, not from the database, so it needs your API token and uses `QJOB_API_URL`. `qjob dash` still connects to the database once at startup, so `QJOB_DB_URL` must be set where it runs, which in practice means the qjob host.
 
 ## Administrative Commands
 
@@ -392,7 +405,7 @@ The scheduler periodically performs the following operations:
 1. Reconciles finished jobs and releases their assigned resources from the resource counters.
 2. Fetches queued jobs.
 3. Sorts candidates by effective priority and submission time.
-4. Dispatches jobs that fit within the available CPU, GPU, and memory counters.
+4. Dispatches jobs that fit within the available CPU, GPU, and memory counters and can be given a block of consecutive free GPU IDs (see [GPU placement](#gpu-placement)).
 5. Applies EASY-style backfilling when the head job is blocked and a safe reservation window can be estimated from running jobs with known walltime.
 
 Effective priority is computed as:
@@ -404,6 +417,26 @@ effective_priority = min(100, base_priority + aging_factor * waiting_hours)
 The current aging factor is 5 priority points per waiting hour.
 
 Resource accounting is stored in the database. The scheduler locks the single `resources` row with `SELECT ... FOR UPDATE` while allocating jobs, which prevents concurrent resource updates from observing stale counters.
+
+### GPU placement
+
+A job that requests GPUs is placed on a block of consecutive GPU IDs, and every ID in the block must be one of the configured GPU IDs. For example, GPUs 2 and 3 form a valid block for a two-GPU job, but GPUs 1 and 3 do not, even when both are free. The block is chosen as follows:
+
+- Among the runs of consecutive free IDs that are long enough, the shortest one is used (best fit), so that longer runs stay available for larger jobs. A one-GPU job therefore takes an isolated free GPU in preference to a GPU inside a longer run.
+- If several runs are equally short, the one with the lowest starting ID is used.
+- The job gets the first GPUs of that run, in ascending order.
+
+For example, with GPUs 0 to 3 configured and GPU 2 busy, the free runs are `0,1` and `3`: a one-GPU job is placed on GPU 3 and a two-GPU job on GPUs 0 and 1.
+
+Because a block is required, a job can wait even though enough GPUs are free in number. With GPUs 0 to 3 configured and GPUs 1 and 2 busy, GPUs 0 and 3 are free but not consecutive, so a two-GPU job waits. Such a job holds up the jobs behind it like any other blocked head job: only EASY-style backfilling can start them, and a backfilled job needs a block of consecutive free GPU IDs of its own.
+
+Backfilling depends on an estimate of when the blocked job can start, which comes from the walltimes of the running jobs. When no estimate is possible, for example because the running jobs have no walltime, nothing behind the blocked job is started and the whole queue waits. Setting a maximum walltime with `qjob admin set-resources --max-walltime` is therefore recommended: jobs submitted without a walltime then inherit it.
+
+A queued job that the current configuration can never satisfy is skipped instead of blocking the queue. This can happen when the administrator changes the node resources after the job was submitted, for example with a smaller `--cpus` or `--mem`, or with a `--gpu-ids` list that has shorter runs of consecutive IDs, because submission only rejects requests that the configuration at that moment cannot satisfy. The skipped job stays `queued` and starts once the configuration allows it. The scheduler logs a WARNING for it the first time it sees the job (a restarted scheduler logs it again), with a message that begins `Skipping job <job_id>`. The WARNING goes to the scheduler's standard error output. When the scheduler runs under systemd (the `qjob-scheduler.service` unit created by `qjob admin install`), read it with:
+
+```bash
+journalctl -u qjob-scheduler
+```
 
 ## REST API Summary
 
@@ -447,6 +480,8 @@ The CLI also accepts `--env-file`, defaulting to `.env`, and loads it if present
 - qjob is a single-node scheduler. It does not currently schedule across multiple machines.
 - Memory is accounted for by request, but not enforced by cgroups or containers. Jobs can still exceed their requested memory unless the deployment adds an external limit.
 - GPU assignment is implemented through `CUDA_VISIBLE_DEVICES`; qjob does not enforce GPU memory limits.
+- GPU placement does not take topology such as NVLink or NUMA into account. Consecutive GPU IDs are used only as a stand-in for topological closeness and do not guarantee that the GPUs are interconnected.
+- The reservation window used for backfilling is estimated from CPU, GPU, and memory counts and ignores the requirement for consecutive GPU IDs, so it is a lower bound on when the blocked job can actually start. Backfilling therefore stays on the conservative side: it never uses a window longer than the real one.
 - CPU affinity is applied with `taskset`, but CPU time is not hard-limited.
 - Job logs are written next to the submitted script using `<script>.out` and `<script>.err`. In shared deployments, consider changing this policy to a central log directory.
 - The API server and scheduler are expected to run as root for multi-user execution. Non-root execution cannot safely drop privileges to arbitrary submitting users.
