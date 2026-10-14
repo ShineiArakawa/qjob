@@ -677,6 +677,16 @@ class TestGetResources:
         assert data["free_gpu_ids"] == [0, 1, 2, 3]
         assert data["max_contiguous_free_gpus"] == 4
 
+    def test_free_gpu_ids_are_ascending(self, client):
+        # The administrator's order must not leak into the free list, and set
+        # iteration order is not ascending for IDs like 9 and 10.
+        crud.set_resources(gpu_ids=[10, 9, 2, 1])
+
+        data = client.get("/resources").json()
+
+        assert data["free_gpu_ids"] == [1, 2, 9, 10]
+        assert data["max_contiguous_free_gpus"] == 2
+
     def test_free_gpu_ids_ignore_jobs_that_do_not_hold_gpus(self, client):
         # Only RUNNING and CANCELLING jobs occupy GPUs, so a stale assigned_gpus
         # on a job in any other state must not hide a free GPU.
