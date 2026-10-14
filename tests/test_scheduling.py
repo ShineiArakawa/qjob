@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
+import logging
 
 import pytest
 
@@ -194,6 +195,37 @@ def _placement(job: models.Job) -> tuple[models.JobStatus, list[int] | None]:
         stored = session.get(models.Job, job.id)
         assigned = stored.assigned_gpus
         return stored.status, (None if assigned is None else json.loads(assigned))
+
+
+def _skip_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Return the formatted messages of the captured "Skipping job" WARNINGs."""
+
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "Skipping job" in record.getMessage()
+    ]
+
+
+def _setup_blocked_head(x_walltime_sec: int | None) -> models.Job:
+    """
+    Build the layout the backfill tests share and return the blocked head job.
+
+    GPUs 0-3 are configured.  X holds GPU 1 (walltime *x_walltime_sec*) and Y
+    holds GPU 2 (no walltime), so the free IDs are 0 and 3 and the counters
+    match the two running jobs.  The head is queued at priority 90 and needs two
+    GPUs: the counters say two are free, but they are not consecutive.
+    """
+
+    _configure_resources(
+        cpus=16, mem_mb=65536, gpu_ids=[0, 1, 2, 3],
+        used_cpus=2, used_gpus=2, used_mem_mb=1024,
+    )
+    _make_running_job(
+        req_gpus=1, gpu_ids=[1], cpu_ids=[0], walltime_sec=x_walltime_sec,
+    )
+    _make_running_job(req_gpus=1, gpu_ids=[2], cpu_ids=[1], walltime_sec=None)
+    return _make_queued_job(req_gpus=2, priority=90)
 
 
 # --------------------------------------------------------------------------------------
@@ -399,6 +431,18 @@ class TestFindBackfillJobs:
             slots_remaining=10,
         )
         assert len(result) == 3
+
+    def test_find_backfill_jobs_without_slot_limit(self):
+        """slots_remaining defaults to no limit: all jobs in the window are returned."""
+        in_window = [_make_queued_job(walltime_sec=300) for _ in range(5)]
+        past_window = _make_queued_job(walltime_sec=950)   # window is 1000 * 0.9
+        sched = _make_scheduler()
+        result = sched._find_backfill_jobs(
+            candidates=[*in_window, past_window],
+            launched_ids=set(),
+            reservation_sec=1000.0,
+        )
+        assert result == in_window
 
 
 # --------------------------------------------------------------------------------------
@@ -779,6 +823,244 @@ class TestContiguousGpuAllocation:
         assert _placement(head) == (models.JobStatus.QUEUED, None)
         assert _placement(backfill_a) == (models.JobStatus.RUNNING, [2, 3])
         assert _placement(backfill_b) == (models.JobStatus.RUNNING, [4, 5])
+
+
+# --------------------------------------------------------------------------------------
+# Scheduler tick — jobs the configuration can never satisfy
+
+
+class TestUnsatisfiableJobs:
+    """
+    _tick() skips queued jobs that the resource configuration can never satisfy.
+
+    Left alone, such a job would become the EASY head and block every job
+    behind it for good.  It stays QUEUED, with one WARNING, until the
+    configuration changes.  Tests that tick more than once reuse one Scheduler:
+    it is the instance that remembers which jobs it has already reported.
+    """
+
+    def test_unsatisfiable_gpu_job_is_skipped(self, monkeypatch, caplog):
+        """
+        GPUs [0, 2, 5] contain no two consecutive IDs, so the 2-GPU job can
+        never run.  It must not block the 1-GPU job behind it, and it is
+        reported once although the scheduler ticks twice.
+        """
+        caplog.set_level(logging.WARNING, logger="qjob.core.scheduler")
+        launched = _patch_start_job(monkeypatch)
+        _configure_resources(cpus=16, mem_mb=65536, gpu_ids=[0, 2, 5])
+        wide = _make_queued_job(req_gpus=2, priority=90)
+        narrow = _make_queued_job(req_gpus=1, priority=10)
+
+        sched = _make_scheduler(max_workers=10)
+        asyncio.run(sched._tick())
+
+        assert launched == [narrow.id]
+        assert _placement(narrow) == (models.JobStatus.RUNNING, [0])
+        assert _placement(wide) == (models.JobStatus.QUEUED, None)
+        warnings = _skip_warnings(caplog)
+        assert len(warnings) == 1
+        assert wide.id in warnings[0]
+        assert "largest block of consecutive GPU IDs: 1" in warnings[0]
+
+        asyncio.run(sched._tick())
+
+        assert _placement(wide) == (models.JobStatus.QUEUED, None)
+        assert len(_skip_warnings(caplog)) == 1
+
+    def test_skipped_job_runs_after_configuration_change(self, monkeypatch, caplog):
+        """
+        A skipped job is not dropped: once the configuration gives it a block, a
+        later tick starts it.  Only the configuration changes; the running 1-GPU
+        job keeps GPU 0, so the 2-GPU job takes [1, 2].  The job is no longer
+        unsatisfiable, so there is no second warning.
+        """
+        caplog.set_level(logging.WARNING, logger="qjob.core.scheduler")
+        launched = _patch_start_job(monkeypatch)
+        _configure_resources(cpus=16, mem_mb=65536, gpu_ids=[0, 2, 5])
+        wide = _make_queued_job(req_gpus=2, priority=90)
+        narrow = _make_queued_job(req_gpus=1, priority=10)
+
+        sched = _make_scheduler(max_workers=10)
+        asyncio.run(sched._tick())
+
+        assert _placement(narrow) == (models.JobStatus.RUNNING, [0])
+        assert _placement(wide) == (models.JobStatus.QUEUED, None)
+        assert len(_skip_warnings(caplog)) == 1
+
+        with database.get_session() as session:
+            session.get(models.Resource, 1).set_configured_gpu_ids([0, 1, 2])
+
+        asyncio.run(sched._tick())
+
+        assert launched == [narrow.id, wide.id]
+        assert _placement(wide) == (models.JobStatus.RUNNING, [1, 2])
+        assert _placement(narrow) == (models.JobStatus.RUNNING, [0])
+        assert len(_skip_warnings(caplog)) == 1
+
+    def test_warning_repeats_when_job_becomes_unsatisfiable_again(self, caplog):
+        """
+        The scheduler forgets a job once it is satisfiable, so a later change
+        that makes it unsatisfiable again is reported again.  The filter is
+        called directly so the job can stay queued at every step.
+        """
+        caplog.set_level(logging.WARNING, logger="qjob.core.scheduler")
+        _configure_resources(cpus=16, mem_mb=65536, gpu_ids=[0, 2, 5])
+        wide = _make_queued_job(req_gpus=2)
+        sched = _make_scheduler()
+
+        def _filter() -> list[models.Job]:
+            with database.get_session() as session:
+                return sched._filter_satisfiable(
+                    session.get(models.Resource, 1), [wide]
+                )
+
+        assert _filter() == []
+        assert len(_skip_warnings(caplog)) == 1
+
+        with database.get_session() as session:
+            session.get(models.Resource, 1).set_configured_gpu_ids([0, 1, 2])
+        assert _filter() == [wide]
+        assert len(_skip_warnings(caplog)) == 1
+
+        with database.get_session() as session:
+            session.get(models.Resource, 1).set_configured_gpu_ids([0, 2, 5])
+        assert _filter() == []
+        assert len(_skip_warnings(caplog)) == 2
+
+    def test_unsatisfiable_cpu_and_memory_jobs_are_skipped(self, monkeypatch):
+        """
+        The check covers every resource, not only GPUs: a job that asks for more
+        CPUs or more memory than the node has is skipped as well.
+        """
+        launched = _patch_start_job(monkeypatch)
+        _configure_resources(cpus=2, mem_mb=4096, gpu_ids=[])
+        too_many_cpus = _make_queued_job(req_cpus=4, priority=90)
+        too_much_mem = _make_queued_job(req_mem_mb=8192, priority=80)
+        fits = _make_queued_job(priority=10)
+
+        sched = _make_scheduler(max_workers=10)
+        asyncio.run(sched._tick())
+
+        assert launched == [fits.id]
+        assert _placement(fits) == (models.JobStatus.RUNNING, [])
+        assert _placement(too_many_cpus) == (models.JobStatus.QUEUED, None)
+        assert _placement(too_much_mem) == (models.JobStatus.QUEUED, None)
+
+    def test_total_gpus_column_mismatch_is_unsatisfiable(self, monkeypatch):
+        """
+        ``gpu_ids`` lists four GPUs but ``total_gpus`` says one.  A block of two
+        exists in the list, yet the counter check can never pass for a 2-GPU job,
+        so the job is skipped instead of blocking the queue.  A CPU-only job
+        behind it still runs.
+        """
+        launched = _patch_start_job(monkeypatch)
+        with database.get_session() as session:
+            row = session.get(models.Resource, 1)
+            row.total_cpus = 16
+            row.total_mem_mb = 65536
+            row.gpu_ids = json.dumps([0, 1, 2, 3])
+            row.total_gpus = 1
+        wide = _make_queued_job(req_gpus=2, priority=90)
+        cpu_only = _make_queued_job(req_gpus=0, priority=10)
+
+        sched = _make_scheduler(max_workers=10)
+        asyncio.run(sched._tick())
+
+        assert launched == [cpu_only.id]
+        assert _placement(wide) == (models.JobStatus.QUEUED, None)
+        assert _placement(cpu_only) == (models.JobStatus.RUNNING, [])
+
+
+# --------------------------------------------------------------------------------------
+# Scheduler tick — EASY backfill with contiguous GPU blocks
+
+
+class TestBackfillWithGpuBlocks:
+    """
+    EASY backfill together with the contiguity rule.
+
+    Every test uses the layout from ``_setup_blocked_head()``: GPUs 0-3 with 1
+    and 2 busy, so the free IDs are 0 and 3 and the two-GPU head is blocked.
+    """
+
+    def test_backfill_respects_contiguity_and_window(self, monkeypatch):
+        """
+        X holds GPU 1 for 1000s, so the head's window is about 900s.  B1 and B3
+        (800s) fit it and each take one of the isolated GPUs, 0 and 3, without
+        overlapping.  B2 (1000s) is longer than the window.  The head stays
+        queued.
+        """
+        launched = _patch_start_job(monkeypatch)
+        head = _setup_blocked_head(x_walltime_sec=1000)
+        b1 = _make_queued_job(req_gpus=1, priority=50, walltime_sec=800)
+        b3 = _make_queued_job(req_gpus=1, priority=45, walltime_sec=800)
+        b2 = _make_queued_job(req_gpus=1, priority=40, walltime_sec=1000)
+
+        sched = _make_scheduler(max_workers=10)
+        asyncio.run(sched._tick())
+
+        assert launched == [b1.id, b3.id]
+        assert _placement(b1) == (models.JobStatus.RUNNING, [0])
+        assert _placement(b3) == (models.JobStatus.RUNNING, [3])
+        assert _placement(b2) == (models.JobStatus.QUEUED, None)
+        assert _placement(head) == (models.JobStatus.QUEUED, None)
+
+    def test_no_backfill_when_reservation_unknown(self, monkeypatch):
+        """
+        Neither running job has a walltime, so the head's window cannot be
+        estimated and nothing is backfilled.
+        """
+        launched = _patch_start_job(monkeypatch)
+        head = _setup_blocked_head(x_walltime_sec=None)
+        b1 = _make_queued_job(req_gpus=1, priority=50, walltime_sec=800)
+        b3 = _make_queued_job(req_gpus=1, priority=45, walltime_sec=800)
+        b2 = _make_queued_job(req_gpus=1, priority=40, walltime_sec=1000)
+
+        sched = _make_scheduler(max_workers=10)
+        asyncio.run(sched._tick())
+
+        assert launched == []
+        for job in (head, b1, b3, b2):
+            assert _placement(job) == (models.JobStatus.QUEUED, None)
+
+    def test_unfit_backfill_candidate_does_not_consume_slot(self, monkeypatch):
+        """
+        Only one worker slot is free (max_workers=3, two jobs running).  C1 is
+        inside the window but needs two consecutive GPUs, which are not free, so
+        it cannot start.  It must not use up the slot: C2 needs one GPU and
+        takes it.
+        """
+        launched = _patch_start_job(monkeypatch)
+        head = _setup_blocked_head(x_walltime_sec=1000)
+        c1 = _make_queued_job(req_gpus=2, priority=60, walltime_sec=100)
+        c2 = _make_queued_job(req_gpus=1, priority=50, walltime_sec=100)
+
+        sched = _make_scheduler(max_workers=3)
+        asyncio.run(sched._tick())
+
+        assert launched == [c2.id]
+        assert _placement(c2) == (models.JobStatus.RUNNING, [0])
+        assert _placement(c1) == (models.JobStatus.QUEUED, None)
+        assert _placement(head) == (models.JobStatus.QUEUED, None)
+
+    def test_backfill_stops_at_worker_slot_limit(self, monkeypatch):
+        """
+        The slot limit is enforced by the tick, not by the candidate search: with
+        one free slot, two backfill jobs that each fit a free GPU still start
+        only the first in queue order, and GPU 3 stays free.
+        """
+        launched = _patch_start_job(monkeypatch)
+        head = _setup_blocked_head(x_walltime_sec=1000)
+        d1 = _make_queued_job(req_gpus=1, priority=60, walltime_sec=100)
+        d2 = _make_queued_job(req_gpus=1, priority=50, walltime_sec=100)
+
+        sched = _make_scheduler(max_workers=3)
+        asyncio.run(sched._tick())
+
+        assert launched == [d1.id]
+        assert _placement(d1) == (models.JobStatus.RUNNING, [0])
+        assert _placement(d2) == (models.JobStatus.QUEUED, None)
+        assert _placement(head) == (models.JobStatus.QUEUED, None)
 
 
 # --------------------------------------------------------------------------------------

@@ -47,6 +47,11 @@ class ResourcePool:
     from the DB so that allocation decisions can be made without a round
     trip to the database.
 
+    This class is legacy.  The production scheduler allocates against the
+    ``resources`` table inside a DB transaction (see ``Scheduler._tick()``)
+    and does not use it.  It does not guarantee that the GPUs it hands out
+    form a block of consecutive IDs.
+
     Attributes
     ----------
     total_cpus : int
@@ -288,6 +293,8 @@ class Scheduler:
         self._install_signal_handlers_enabled = install_signal_handlers
         self._running: bool = False
         self._lock_conn: sqlalchemy.engine.Connection | None = None
+        # Queued jobs already reported as unsatisfiable, so each is logged once.
+        self._warned_unsatisfiable: set[str] = set()
 
     # -- Public API --------------------------------------------------------------------
 
@@ -373,11 +380,13 @@ class Scheduler:
         2. Sort the queue by effective priority DESC, submitted_at ASC.
            Effective priority is computed in-memory (base priority + ageing);
            the DB value is never mutated.
-        3. Try to run the head job; fall back to EASY Backfill when blocked.
+        3. Skip jobs the current resource configuration can never satisfy;
+           they stay QUEUED and a WARNING is logged once.
+        4. Try to run the head job; fall back to EASY Backfill when blocked.
            A job starts only when it fits the resource counters and a block of
            consecutive free GPU IDs exists for it.
-        4. Stop at the first blocked head (single reservation guarantee).
-        5. Repeat until the worker slot limit is reached.
+        5. Stop at the first blocked head (single reservation guarantee).
+        6. Repeat until the worker slot limit is reached.
 
         Parameters
         ----------
@@ -407,6 +416,10 @@ class Scheduler:
 
             resource_row = session.get(models.Resource, 1)
             if resource_row is None:
+                return
+
+            candidates = self._filter_satisfiable(resource_row, candidates)
+            if not candidates:
                 return
 
             # One mutable set of free GPU IDs for the whole tick, so the block a
@@ -444,9 +457,12 @@ class Scheduler:
                             candidates=candidates[head_idx + 1:],
                             launched_ids=launched_ids,
                             reservation_sec=reservation_sec,
-                            slots_remaining=slots - dispatched,
                         )
                         for bf_job in backfill:
+                            # The slot limit counts started jobs only, so a
+                            # candidate that finds no GPU block uses no slot.
+                            if dispatched >= slots:
+                                break
                             bf_block = self._select_gpu_block(
                                 resource_row, bf_job, free_gpu_ids
                             )
@@ -610,6 +626,12 @@ class Scheduler:
         Jobs without a walltime are ignored — their finish time cannot be
         predicted.
 
+        Only the CPU, GPU and memory counts are simulated.  The requirement
+        that a multi-GPU job gets consecutive GPU IDs is not modelled, so the
+        estimate is a lower bound on the head job's true start time.  Backfill
+        therefore errs on the conservative side: it never uses a window that is
+        longer than the real one.
+
         Parameters
         ----------
         session : sqlalchemy.orm.Session
@@ -679,7 +701,7 @@ class Scheduler:
         candidates:      list[models.Job],
         launched_ids:    set[str],
         reservation_sec: float,
-        slots_remaining: int,
+        slots_remaining: int | None = None,
     ) -> list[models.Job]:
         """
         Return jobs from *candidates* eligible for backfilling.
@@ -698,20 +720,23 @@ class Scheduler:
             IDs already dispatched this tick (to avoid double-launch).
         reservation_sec : float
             Estimated seconds until the head job's resources are available.
-        slots_remaining : int
-            Maximum number of additional jobs that can be started this tick.
+        slots_remaining : int | None
+            Maximum number of jobs to return.  ``None`` (the default) means no
+            limit; ``_tick()`` passes none and enforces the worker slot limit
+            itself, counting only the jobs it actually starts.
 
         Returns
         -------
         list[models.Job]
-            Backfill candidates in queue order, limited to *slots_remaining*.
+            Backfill candidates in queue order, limited to *slots_remaining*
+            when it is given.
         """
 
         window = reservation_sec * _BACKFILL_WALLTIME_MARGIN
         result: list[models.Job] = []
 
         for job in candidates:
-            if len(result) >= slots_remaining:
+            if slots_remaining is not None and len(result) >= slots_remaining:
                 break
             if job.id in launched_ids:
                 continue
@@ -795,6 +820,92 @@ class Scheduler:
         if not resource_row.can_fit(job):
             return None
         return gpu_blocks.find_contiguous_block(free_gpu_ids, job.req_gpus)
+
+    def _is_satisfiable(
+        self,
+        resource_row: models.Resource,
+        job:          models.Job,
+    ) -> bool:
+        """
+        Return True if *job* could start on this node with nothing else running.
+
+        This is exactly the case where ``_select_gpu_block()`` would succeed on
+        an idle node: the request fits the *total* CPUs, GPUs and memory, and the
+        configured GPU IDs contain a block of ``job.req_gpus`` consecutive IDs.
+        When it is False the job cannot start until the configuration changes.
+
+        Parameters
+        ----------
+        resource_row : models.Resource
+            The resource row that holds the configured capacity.
+        job : models.Job
+            The queued job to check.
+
+        Returns
+        -------
+        bool
+            False when the current configuration can never place the job.
+        """
+
+        return (
+            job.req_cpus <= resource_row.total_cpus
+            and job.req_gpus <= resource_row.total_gpus
+            and job.req_mem_mb <= resource_row.total_mem_mb
+            and gpu_blocks.find_contiguous_block(
+                resource_row.configured_gpu_ids, job.req_gpus
+            ) is not None
+        )
+
+    def _filter_satisfiable(
+        self,
+        resource_row: models.Resource,
+        candidates:   list[models.Job],
+    ) -> list[models.Job]:
+        """
+        Return the jobs in *candidates* that the configuration can satisfy.
+
+        A job that can never be placed would, as the head of the queue, block
+        every job behind it for good.  It is left out and stays QUEUED, and a
+        WARNING is logged the first time it is seen.  The set of IDs already
+        reported is replaced on every call with the IDs that are unsatisfiable
+        now, so a job that left the queue or became satisfiable is forgotten
+        and is reported again if the configuration later changes back.
+
+        Parameters
+        ----------
+        resource_row : models.Resource
+            The resource row that holds the configured capacity.
+        candidates : list[models.Job]
+            Queued jobs in scheduling order.
+
+        Returns
+        -------
+        list[models.Job]
+            The satisfiable jobs, in their original order.
+        """
+
+        satisfiable: list[models.Job] = []
+        unsatisfiable_ids: set[str] = set()
+
+        for job in candidates:
+            if self._is_satisfiable(resource_row, job):
+                satisfiable.append(job)
+                continue
+
+            unsatisfiable_ids.add(job.id)
+            if job.id not in self._warned_unsatisfiable:
+                logger.warning(
+                    "Skipping job %s (user=%s name=%s): it requests cpus=%d gpus=%d "
+                    "mem=%dMB, which the current resource configuration can never "
+                    "satisfy (largest block of consecutive GPU IDs: %d). It stays "
+                    "queued until the configuration changes.",
+                    job.id, job.user, job.name, job.req_cpus, job.req_gpus,
+                    job.req_mem_mb,
+                    gpu_blocks.max_contiguous_run(resource_row.configured_gpu_ids),
+                )
+
+        self._warned_unsatisfiable = unsatisfiable_ids
+        return satisfiable
 
     def _allocate_db(
         self,
