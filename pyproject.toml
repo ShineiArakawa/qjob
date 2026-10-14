@@ -1,6 +1,6 @@
 [project]
 name = "qjob"
-version = "1.2.0"
+version = "1.4.0"
 description = "A lightweight job scheduler designed for single-node lab-scale GPU servers."
 readme = "README.md"
 requires-python = ">=3.12"
